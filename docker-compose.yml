@@ -1,0 +1,48 @@
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: flowforge-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-flowforge}
+      POSTGRES_USER: ${DB_USER:-flowforge}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-flowforge}
+    ports:
+      - "${HOST_DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-flowforge} -d ${DB_NAME:-flowforge}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: flowforge-web
+    restart: unless-stopped
+    command: python manage.py runserver 0.0.0.0:8000
+    volumes:
+      - ./src:/app/src
+    ports:
+      - "${PORT:-8001}:8000"
+    environment:
+      - SECRET_KEY=${SECRET_KEY:-insecure-dev-secret-key-change-in-production-only}
+      - DEBUG=${DEBUG:-True}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-localhost,127.0.0.1,[::1],web}
+      - DB_ENGINE=django.db.backends.postgresql
+      - DB_NAME=${DB_NAME:-flowforge}
+      - DB_USER=${DB_USER:-flowforge}
+      - DB_PASSWORD=${DB_PASSWORD:-flowforge}
+      - DB_HOST=db
+      - DB_PORT=5432
+      - PYTHONPATH=/app/src
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
