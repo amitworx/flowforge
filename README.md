@@ -7,11 +7,20 @@ FlowForge is an open-source, self-hostable Python document-processing and workfl
 
 ---
 
+> [!WARNING]
+> **Development vs. Production Notice:**
+> The provided `docker-compose.yml`, `Dockerfile`, Django `runserver`, `.env.example`, and sample credentials (`SECRET_KEY`, `flowforge` database password) are **strictly for local development and testing only**.
+> - In `production` or `staging` environments, the application **strictly rejects** the sample/insecure secret key, refuses to start if `DEBUG=True`, and rejects the default database password.
+> - PostgreSQL in `docker-compose.yml` is hardened by default to bind only to `127.0.0.1` (localhost), preventing accidental exposure to the host network or public internet.
+> - Never deploy to production using development configurations or sample secrets.
+
+---
+
 ## Architectural Overview
 
 - **Core Engine:** Django 5.2 (LTS) & Django REST Framework (DRF)
 - **Database:** PostgreSQL 17 (via `psycopg` 3)
-- **Configuration:** Typed configuration via `pydantic-settings`
+- **Configuration:** Typed configuration via `pydantic-settings` with strict environment-mode validation
 - **Linting & Formatting:** Ruff
 - **Test Suite:** pytest with `pytest-django`
 
@@ -21,7 +30,7 @@ FlowForge is an open-source, self-hostable Python document-processing and workfl
 
 ---
 
-## Quick Start with Docker Compose (Recommended)
+## Quick Start with Docker Compose (Local Development)
 
 Docker Compose provides a reproducible environment that starts both the PostgreSQL database and the web application without requiring PostgreSQL or Python installed on the host.
 
@@ -35,7 +44,14 @@ docker compose up -d --build
 ```
 
 The application will be accessible at:
-- **Health Check:** `http://localhost:8001/api/v1/health/` (or port configured via `PORT` variable)
+- **Health Check:** `http://127.0.0.1:8001/api/v1/health/` (or host port configured via `PORT` variable)
+
+### Running Database Migrations
+Migrations do **not** run automatically on container startup to prevent unexpected schema mutations. To apply migrations inside Docker Compose:
+
+```bash
+docker compose exec web python manage.py migrate
+```
 
 To view running containers and logs:
 ```bash
@@ -43,14 +59,16 @@ docker compose ps
 docker compose logs -f web
 ```
 
-To stop the containers:
+To stop the containers (preserving persistent database volume):
 ```bash
 docker compose down
 ```
 
 ---
 
-## Local Development Setup
+## Local Development Setup (Host Python + Docker PostgreSQL)
+
+This workflow runs PostgreSQL in Docker while running Python/Django directly on your Windows or Unix host.
 
 ### Prerequisites
 - Python 3.12+
@@ -59,17 +77,20 @@ docker compose down
 ### 1. Environment Setup
 
 Copy the example environment configuration:
-```bash
-# On Linux / macOS / Bash
-cp .env.example .env
 
-# On Windows PowerShell
+**Windows PowerShell:**
+```powershell
 Copy-Item .env.example .env
+```
+
+**Linux / macOS / Bash:**
+```bash
+cp .env.example .env
 ```
 
 ### 2. Start PostgreSQL Container
 
-Run the dedicated database service with persistent volume:
+Run the dedicated database service. The database port is bound to `127.0.0.1:5432` by default:
 ```bash
 docker compose up -d db
 ```
@@ -110,12 +131,12 @@ PYTHONPATH=src python manage.py migrate
 **Windows PowerShell:**
 ```powershell
 $env:PYTHONPATH="src"
-python manage.py runserver 0.0.0.0:8000
+python manage.py runserver 127.0.0.1:8000
 ```
 
 **Linux / macOS / Bash:**
 ```bash
-PYTHONPATH=src python manage.py runserver 0.0.0.0:8000
+PYTHONPATH=src python manage.py runserver 127.0.0.1:8000
 ```
 
 ---
@@ -157,7 +178,7 @@ pip-audit -r requirements.txt
 {
   "status": "ok",
   "version": "0.1.0",
-  "timestamp": "2026-11-06T06:09:16.347132+00:00",
+  "timestamp": "2026-11-06T15:03:47.773429+00:00",
   "checks": {
     "database": "healthy"
   }
@@ -169,7 +190,7 @@ pip-audit -r requirements.txt
 {
   "status": "unhealthy",
   "version": "0.1.0",
-  "timestamp": "2026-11-06T06:09:16.347132+00:00",
+  "timestamp": "2026-11-06T15:03:47.773429+00:00",
   "checks": {
     "database": "unhealthy"
   }
@@ -182,10 +203,12 @@ pip-audit -r requirements.txt
 
 ## Troubleshooting
 
-- **Port Conflict (`listen tcp 0.0.0.0:8000: bind`):**
-  If port 8000 is occupied on your host machine, `docker-compose.yml` defaults host port mapping to `8001:8000`. You can customize the exposed port using `PORT=<number> docker compose up -d`.
+- **Port Conflict (`listen tcp 127.0.0.1:8000: bind`):**
+  If port 8000 is occupied on your host, `docker-compose.yml` defaults host port mapping to `127.0.0.1:8001:8000`. You can customize the exposed port using `PORT=8005 docker compose up -d`.
+- **PostgreSQL Port Binding:**
+  By default, `docker-compose.yml` binds PostgreSQL to `127.0.0.1:5432` (`${DB_HOST_BIND:-127.0.0.1}`). If port 5432 is occupied on the host, set `HOST_DB_PORT=5433` in your `.env`.
 - **Database Connection Refused:**
-  Ensure the `db` service is healthy using `docker compose ps`. When running tests locally outside Docker, ensure `flowforge-db` is running on port 5432.
+  Ensure the `db` service is healthy using `docker compose ps`. When running tests locally outside Docker, ensure `db` is running on port 5432.
 
 ---
 
