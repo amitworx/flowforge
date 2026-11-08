@@ -21,12 +21,17 @@ FlowForge is an open-source, self-hostable Python document-processing and workfl
 - **Core Engine:** Django 5.2 (LTS) & Django REST Framework (DRF)
 - **Database:** PostgreSQL 17 (via `psycopg` 3)
 - **Configuration:** Typed configuration via `pydantic-settings` with strict environment-mode validation
+- **Ingestion Engine:** Synchronous, deterministic CSV/JSON processing with safe bounding and normalization
 - **Linting & Formatting:** Ruff
 - **Test Suite:** pytest with `pytest-django`
 
 ### API Layout
 - Versioned API base: `/api/v1/`
 - Health check endpoint: `GET /api/v1/health/`
+- Ingestion jobs endpoint: `POST /api/v1/jobs/` (Authenticated)
+- List user jobs: `GET /api/v1/jobs/` (Authenticated)
+- Retrieve job metadata: `GET /api/v1/jobs/{uuid}/` (Authenticated)
+- Download normalized JSON: `GET /api/v1/jobs/{uuid}/download/` (Authenticated)
 
 ---
 
@@ -62,6 +67,70 @@ docker compose logs -f web
 To stop the containers (preserving persistent database volume):
 ```bash
 docker compose down
+```
+
+---
+
+## Ingestion Core API (M0-002)
+
+FlowForge provides deterministic ingestion for tabular data (CSV and JSON) without relying on external cloud AI or queues.
+
+### Policy & Security Guardrails
+- **File size cap:** 1 MiB maximum upload size (bounded stream reading).
+- **Row count cap:** 1,000 records maximum per dataset.
+- **Authentication:** All `/api/v1/jobs/` endpoints require authentication (Session or Basic Auth).
+- **Data Isolation:** Enforced object-level ownership—users can only list, view, and download their own jobs.
+- **CSV Handling:** UTF-8 encoded (UTF-8 BOM handled), mandatory header row, duplicate header detection, cell string preservation (including leading zeros).
+- **JSON Handling:** UTF-8 array of uniform objects with scalar values (nested complex objects are rejected to avoid unconstrained depth/memory usage).
+
+### HTTP Usage Examples
+
+Sample test files are available in the [`examples/`](examples/) directory:
+- [`examples/sample.csv`](examples/sample.csv)
+- [`examples/sample.json`](examples/sample.json)
+
+#### 1. Ingest a CSV File
+```bash
+curl -u <username>:<password> \
+  -F "file=@examples/sample.csv" \
+  http://127.0.0.1:8001/api/v1/jobs/
+```
+
+**Response (`201 Created`):**
+```json
+{
+  "id": "af164e84-db1a-48e7-be0a-049a324ec3b8",
+  "file_type": "csv",
+  "state": "completed",
+  "original_filename": "sample.csv",
+  "input_row_count": 3,
+  "output_row_count": 3,
+  "validation_errors": null,
+  "column_names": ["id", "name", "department", "badge_number"],
+  "download_url": "http://127.0.0.1:8001/api/v1/jobs/af164e84-db1a-48e7-be0a-049a324ec3b8/download/",
+  "created_at": "2026-11-08T21:26:23.632263Z",
+  "updated_at": "2026-11-08T21:26:23.632280Z"
+}
+```
+
+#### 2. Ingest a JSON Dataset
+```bash
+curl -u <username>:<password> \
+  -F "file=@examples/sample.json" \
+  http://127.0.0.1:8001/api/v1/jobs/
+```
+
+#### 3. List Ingestion Jobs
+```bash
+curl -u <username>:<password> \
+  http://127.0.0.1:8001/api/v1/jobs/
+```
+
+#### 4. Download Normalized Output
+```bash
+curl -u <username>:<password> \
+  -O -J \
+  http://127.0.0.1:8001/api/v1/jobs/<job-id>/download/
 ```
 
 ---
@@ -178,7 +247,7 @@ pip-audit -r requirements.txt
 {
   "status": "ok",
   "version": "0.1.0",
-  "timestamp": "2026-11-06T15:03:47.773429+00:00",
+  "timestamp": "2026-11-08T21:23:31.633401+00:00",
   "checks": {
     "database": "healthy"
   }
@@ -190,14 +259,12 @@ pip-audit -r requirements.txt
 {
   "status": "unhealthy",
   "version": "0.1.0",
-  "timestamp": "2026-11-06T15:03:47.773429+00:00",
+  "timestamp": "2026-11-08T21:23:31.633401+00:00",
   "checks": {
     "database": "unhealthy"
   }
 }
 ```
-
-> **Note on Health Check Scope:** The endpoint checks database query responsiveness (`SELECT 1;`). It does not verify external networks or asynchronous message queues as those are outside the foundation scope.
 
 ---
 
