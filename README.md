@@ -9,9 +9,10 @@ FlowForge is an open-source, self-hostable Python document-processing and workfl
 
 > [!WARNING]
 > **Development vs. Production Notice:**
-> The provided `docker-compose.yml`, `Dockerfile`, Django `runserver`, `.env.example`, and sample credentials (`SECRET_KEY`, `flowforge` database password) are **strictly for local development and testing only**.
-> - In `production` or `staging` environments, the application **strictly rejects** the sample/insecure secret key, refuses to start if `DEBUG=True`, and rejects the default database password.
-> - PostgreSQL in `docker-compose.yml` is hardened by default to bind only to `127.0.0.1` (localhost), preventing accidental exposure to the host network or public internet.
+> The provided `docker-compose.yml`, `Dockerfile`, Django `runserver`, `.env.example`, and sample credentials (`SECRET_KEY`, `flowforge` database password, and sample credentials like `devuser:devpass123`) are **strictly for local development and testing only**.
+> - **Authentication Security:** HTTP Basic Authentication (`Authorization: Basic ...`) transmits credentials encoded in Base64 (unencrypted). In local development over `localhost` / `127.0.0.1`, this is acceptable for rapid testing. Outside local development, **Basic Authentication strictly requires TLS/HTTPS** or a secure session/token infrastructure to prevent credential interception.
+> - **Environment Validation:** In `production` or `staging` environments, the application **strictly rejects** the sample/insecure secret key, refuses to start if `DEBUG=True`, and rejects default database credentials.
+> - **Port Hardening:** PostgreSQL in `docker-compose.yml` is hardened by default to bind only to `127.0.0.1` (localhost), preventing accidental exposure to the host network or public internet.
 > - Never deploy to production using development configurations or sample secrets.
 
 ---
@@ -21,12 +22,17 @@ FlowForge is an open-source, self-hostable Python document-processing and workfl
 - **Core Engine:** Django 5.2 (LTS) & Django REST Framework (DRF)
 - **Database:** PostgreSQL 17 (via `psycopg` 3)
 - **Configuration:** Typed configuration via `pydantic-settings` with strict environment-mode validation
+- **Ingestion Engine:** Synchronous, deterministic CSV/JSON processing with safe multi-layer bounding and normalization
 - **Linting & Formatting:** Ruff
 - **Test Suite:** pytest with `pytest-django`
 
 ### API Layout
 - Versioned API base: `/api/v1/`
 - Health check endpoint: `GET /api/v1/health/`
+- Ingestion jobs endpoint: `POST /api/v1/jobs/` (Authenticated)
+- List user jobs: `GET /api/v1/jobs/` (Authenticated)
+- Retrieve job metadata: `GET /api/v1/jobs/{uuid}/` (Authenticated)
+- Download normalized JSON: `GET /api/v1/jobs/{uuid}/download/` (Authenticated)
 
 ---
 
@@ -62,6 +68,79 @@ docker compose logs -f web
 To stop the containers (preserving persistent database volume):
 ```bash
 docker compose down
+```
+
+---
+
+## Ingestion Core API (M0-002 & M0-002A)
+
+FlowForge provides deterministic ingestion for tabular data (CSV and JSON) without relying on external cloud AI or queues.
+
+### Multi-Layer Upload Bounding Architecture
+Uploads are bounded through defense-in-depth layers to guarantee application memory safety without reading unbounded payloads:
+1. **Layer 1 (Request Boundary):** `Content-Length` header is checked on the incoming request before reading multipart data; requests exceeding the limit (1 MiB + multipart boundary overhead) are rejected early with `413 Request Entity Too Large`.
+2. **Layer 2 (Upload Object Boundary):** Uploaded file metadata (`uploaded_file.size`) is inspected; files exceeding 1 MiB are rejected immediately with `413 Request Entity Too Large`.
+3. **Layer 3 (Streaming Read Boundary):** `parse_and_normalize_stream` reads only up to `MAX_UPLOAD_SIZE_BYTES + 1` bytes from the stream, preventing unconstrained memory consumption regardless of client headers.
+4. **Layer 4 (Record Count Boundary):** Parsers enforce a strict cap of **1,000 records/rows maximum**. Payloads with 1,001 or more rows are rejected cleanly with `400 Bad Request`.
+
+### Policy & Validation Guardrails
+- **CSV Handling:** Strict parsing (`csv.reader(..., strict=True)`) rejects malformed quoting, unterminated quotes, and syntax errors as clean 400 responses. UTF-8 encoded (UTF-8 BOM automatically handled), required non-empty headers, duplicate header detection, cell string preservation (e.g., leading zeros like `"00142"`).
+- **JSON Handling:** UTF-8 encoded top-level array of uniform scalar objects. Nested dictionaries and lists are rejected to protect against unbounded recursion depth. Column ordering is deterministically unified across objects.
+- **Extension & Content Disagreement Policy:** File extension and content must agree:
+  - Files named `.json` must contain valid JSON syntax (`[` or `{`); uploading CSV with a `.json` extension is rejected with `400 Bad Request`.
+  - Files named `.csv` must not contain JSON syntax; uploading JSON with a `.csv` extension is rejected with `400 Bad Request`.
+  - Unsupported file extensions (e.g., `.exe`, `.py`, `.xml`) are cleanly rejected with `400 Bad Request`.
+- **Authentication:** All `/api/v1/jobs/` endpoints require authentication. Basic authentication in local examples is for development testing only; production deployments require HTTPS.
+- **Data Isolation:** Object-level ownership is strictly enforced—users can only list, view, and download their own jobs.
+
+### HTTP Usage Examples
+
+Sample test files are available in the [`examples/`](examples/) directory:
+- [`examples/sample.csv`](examples/sample.csv)
+- [`examples/sample.json`](examples/sample.json)
+
+#### 1. Ingest a CSV File
+```bash
+curl -u devuser:devpass123 \
+  -F "file=@examples/sample.csv" \
+  http://127.0.0.1:8001/api/v1/jobs/
+```
+
+**Response (`201 Created`):**
+```json
+{
+  "id": "0811b650-4c2e-4c1d-8059-a0ea2707a483",
+  "file_type": "csv",
+  "state": "completed",
+  "original_filename": "sample.csv",
+  "input_row_count": 3,
+  "output_row_count": 3,
+  "validation_errors": null,
+  "column_names": ["id", "name", "department", "badge_number"],
+  "download_url": "http://127.0.0.1:8001/api/v1/jobs/0811b650-4c2e-4c1d-8059-a0ea2707a483/download/",
+  "created_at": "2026-11-09T05:58:33.272298Z",
+  "updated_at": "2026-11-09T05:58:33.272321Z"
+}
+```
+
+#### 2. Ingest a JSON Dataset
+```bash
+curl -u devuser:devpass123 \
+  -F "file=@examples/sample.json" \
+  http://127.0.0.1:8001/api/v1/jobs/
+```
+
+#### 3. List Ingestion Jobs
+```bash
+curl -u devuser:devpass123 \
+  http://127.0.0.1:8001/api/v1/jobs/
+```
+
+#### 4. Download Normalized Output
+```bash
+curl -u devuser:devpass123 \
+  -O -J \
+  http://127.0.0.1:8001/api/v1/jobs/<job-id>/download/
 ```
 
 ---
@@ -178,7 +257,7 @@ pip-audit -r requirements.txt
 {
   "status": "ok",
   "version": "0.1.0",
-  "timestamp": "2026-11-06T15:03:47.773429+00:00",
+  "timestamp": "2026-11-08T21:23:31.633401+00:00",
   "checks": {
     "database": "healthy"
   }
@@ -190,14 +269,12 @@ pip-audit -r requirements.txt
 {
   "status": "unhealthy",
   "version": "0.1.0",
-  "timestamp": "2026-11-06T15:03:47.773429+00:00",
+  "timestamp": "2026-11-08T21:23:31.633401+00:00",
   "checks": {
     "database": "unhealthy"
   }
 }
 ```
-
-> **Note on Health Check Scope:** The endpoint checks database query responsiveness (`SELECT 1;`). It does not verify external networks or asynchronous message queues as those are outside the foundation scope.
 
 ---
 

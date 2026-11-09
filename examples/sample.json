@@ -1,0 +1,14 @@
+[
+  {
+    "id": "item_01",
+    "name": "Widget Alpha",
+    "quantity": 50,
+    "available": true
+  },
+  {
+    "id": "item_02",
+    "name": "Gadget Beta",
+    "quantity": 120,
+    "available": false
+  }
+]
