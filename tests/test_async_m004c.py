@@ -67,9 +67,15 @@ def test_parallel_recovery_commands_cannot_both_reserve_same_run(sample_job, sam
     def run_cmd():
         # New DB connection per thread
         connection.close()
-        with patch(
-            "flowforge.workflows.management.commands.recover_workflow_runs.execute_workflow_run_task.delay",
-            side_effect=fake_delay,
+        with (
+            patch(
+                "flowforge.workflows.tasks.execute_workflow_run_task.delay",
+                side_effect=fake_delay,
+            ),
+            patch(
+                "flowforge.workflows.management.commands.recover_workflow_runs.execute_workflow_run_task.delay",
+                side_effect=fake_delay,
+            ),
         ):
             call_command("recover_workflow_runs", max_attempts=5, ignore_backoff=True)
         connection.close()
