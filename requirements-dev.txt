@@ -4,14 +4,31 @@
 #
 #    pip-compile --extra=dev --output-file=requirements-dev.txt pyproject.toml
 #
+amqp==5.4.2
+    # via kombu
 annotated-types==0.8.0
     # via pydantic
 asgiref==3.13.0
     # via django
+billiard==4.3.2
+    # via celery
 build==1.6.1
     # via pip-tools
+celery==5.7.0
+    # via flowforge (pyproject.toml)
 click==8.5.0
-    # via pip-tools
+    # via
+    #   celery
+    #   click-didyoumean
+    #   click-plugins
+    #   click-repl
+    #   pip-tools
+click-didyoumean==0.3.1
+    # via celery
+click-plugins==1.1.1.2
+    # via celery
+click-repl==0.4.1
+    # via celery
 colorama==0.4.6
     # via
     #   build
@@ -24,15 +41,20 @@ djangorestframework==3.18.3
     # via flowforge (pyproject.toml)
 iniconfig==2.3.1
     # via pytest
+kombu==5.7.0
+    # via celery
 packaging==26.3
     # via
     #   build
+    #   flowforge (pyproject.toml)
     #   pytest
     #   wheel
 pip-tools==7.6.2
     # via flowforge (pyproject.toml)
 pluggy==1.7.0
     # via pytest
+prompt-toolkit==3.0.53
+    # via click-repl
 psycopg[binary]==3.3.8
     # via flowforge (pyproject.toml)
 psycopg-binary==3.3.8
@@ -57,16 +79,23 @@ pytest==9.2.0
     #   pytest-django
 pytest-django==4.14.0
     # via flowforge (pyproject.toml)
+python-dateutil==2.9.0.post0
+    # via celery
 python-dotenv==1.2.4
     # via
     #   flowforge (pyproject.toml)
     #   pydantic-settings
+redis==8.1.0
+    # via flowforge (pyproject.toml)
 ruff==0.17.4
     # via flowforge (pyproject.toml)
+six==1.17.0
+    # via python-dateutil
 sqlparse==0.6.1
     # via django
 typing-extensions==4.16.0
     # via
+    #   click-repl
     #   psycopg
     #   pydantic
     #   pydantic-core
@@ -79,7 +108,18 @@ typing-inspection==0.4.5
 tzdata==2026.6
     # via
     #   django
+    #   kombu
     #   psycopg
+    #   tzlocal
+tzlocal==5.4.5
+    # via celery
+vine==5.1.0
+    # via
+    #   amqp
+    #   celery
+    #   kombu
+wcwidth==0.9.4
+    # via prompt-toolkit
 wheel==0.48.0
     # via pip-tools
 
