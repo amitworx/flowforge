@@ -25,6 +25,7 @@ INSTALLED_APPS = [
     # Local apps
     "flowforge.core",
     "flowforge.processing",
+    "flowforge.workflows",
 ]
 
 MIDDLEWARE = [
