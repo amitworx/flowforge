@@ -2,7 +2,7 @@ import json
 
 from django.db import transaction
 from django.http import HttpResponse
-from rest_framework import status
+from rest_framework import exceptions, status
 from rest_framework.exceptions import NotFound
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import MultiPartParser
@@ -21,6 +21,13 @@ from flowforge.processing.services import (
     IngestionError,
     parse_and_normalize_stream,
 )
+from flowforge.processing.upload_handlers import BoundedFileUploadHandler
+
+
+class PayloadTooLarge(exceptions.APIException):
+    status_code = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+    default_detail = "Request payload exceeds maximum allowed limit of 1 MiB."
+    default_code = "payload_too_large"
 
 
 class JobPagination(PageNumberPagination):
@@ -55,11 +62,8 @@ class ProcessingJobListCreateView(APIView):
             try:
                 # Add 64 KiB tolerance for multipart boundaries and headers
                 if int(content_length) > (MAX_UPLOAD_SIZE_BYTES + 65536):
-                    # Raise early rejection for oversized payloads
-                    return Response(
-                        {"detail": "Request payload exceeds maximum allowed limit of 1 MiB."},
-                        status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    )
+                    # Raise early rejection for oversized payloads so execution terminates immediately
+                    raise PayloadTooLarge()
             except (ValueError, TypeError):
                 pass
         return super().initial(request, *args, **kwargs)
@@ -72,17 +76,15 @@ class ProcessingJobListCreateView(APIView):
         return paginator.get_paginated_response(serializer.data)
 
     def post(self, request: Request) -> Response:
-        # Check if Content-Length check in initial flagged an early response
-        content_length = request.META.get("CONTENT_LENGTH")
-        if content_length:
-            try:
-                if int(content_length) > (MAX_UPLOAD_SIZE_BYTES + 65536):
-                    return Response(
-                        {"detail": "Request payload exceeds maximum allowed limit of 1 MiB."},
-                        status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    )
-            except (ValueError, TypeError):
-                pass
+        # Check if any upload handler aborted due to size limits
+        for handler in getattr(request._request, "upload_handlers", []):
+            if isinstance(handler, BoundedFileUploadHandler) and (
+                getattr(handler, "upload_aborted", False)
+                or getattr(handler, "total_upload_size", 0) > MAX_UPLOAD_SIZE_BYTES
+            ):
+                raise PayloadTooLarge(
+                    detail=f"File size exceeds maximum allowed limit of {MAX_UPLOAD_SIZE_BYTES} bytes (1 MiB)."
+                )
 
         if "file" not in request.FILES:
             return Response(
