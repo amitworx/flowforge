@@ -33,6 +33,12 @@ FlowForge is an open-source, self-hostable Python document-processing and workfl
 - List user jobs: `GET /api/v1/jobs/` (Authenticated)
 - Retrieve job metadata: `GET /api/v1/jobs/{uuid}/` (Authenticated)
 - Download normalized JSON: `GET /api/v1/jobs/{uuid}/download/` (Authenticated)
+- Create workflow definition: `POST /api/v1/workflows/` (Authenticated)
+- List workflow definitions: `GET /api/v1/workflows/` (Authenticated)
+- Retrieve workflow definition: `GET /api/v1/workflows/{uuid}/` (Authenticated)
+- Execute workflow run: `POST /api/v1/workflows/{uuid}/runs/` (Authenticated)
+- List workflow runs: `GET /api/v1/workflow-runs/` (Authenticated)
+- Retrieve workflow run details: `GET /api/v1/workflow-runs/{uuid}/` (Authenticated)
 
 ---
 
@@ -216,6 +222,91 @@ python manage.py runserver 127.0.0.1:8000
 **Linux / macOS / Bash:**
 ```bash
 PYTHONPATH=src python manage.py runserver 127.0.0.1:8000
+```
+
+---
+
+## Workflow Engine API (M0-003)
+
+FlowForge provides a synchronous, deterministic workflow execution engine that runs directly against completed ingestion jobs (`ProcessingJob`).
+
+### Core Design & Guarantees
+- **Pure Python Core:** The pipeline transformation engine (`flowforge.workflows.engine`) contains zero database or HTTP dependencies and is independently testable.
+- **Strict Determinism:** Transformations operate predictably without arbitrary eval/exec code or unconstrained expressions.
+- **Snapshot Immutability:** When a workflow is executed, an immutable snapshot of the definition's steps is stored directly in the `WorkflowRun`. Subsequent mutations to the definition do not retroactively alter execution history.
+- **Audit Durability:** Each step execution produces an ordered audit record in `WorkflowStepRun` tracking step index, operation, row counts, and status (`completed` or `failed`). If a step fails, the failure is recorded, previous step audits are preserved, and partial results are never marked as completed.
+- **Resource Bounds:** Maximum 10 steps per workflow, maximum 1,000 input/output rows, and maximum 128 characters for names and columns.
+- **Source Protection:** Running a workflow never alters or mutates the source `ProcessingJob.output_data`.
+
+### Supported Transformations
+1. `select_columns`: Filters and orders columns in output rows.
+   ```json
+   {"op": "select_columns", "columns": ["id", "username", "role"]}
+   ```
+2. `rename_columns`: Renames existing columns while checking for collisions and preserving defined order.
+   ```json
+   {"op": "rename_columns", "mapping": {"username": "handle"}}
+   ```
+3. `filter_equals`: Performs strict, type-sensitive scalar comparison (`string`, `int`, `float`, `bool`, or `null`).
+   ```json
+   {"op": "filter_equals", "column": "role", "value": "admin"}
+   ```
+   - **Type Sensitivity Policy:** In standard Python, `True == 1` and `False == 0` evaluate to True. FlowForge's engine strictly prevents this: boolean `True`/`False` values never match numeric `1`/`0`. Numeric comparison between `int` and `float` is supported (e.g. `1 == 1.0`). `null` (None) strictly matches only `null`. String values preserve exact formatting, leading zeros, and casing.
+   - **Empty Result & Schema Propagation Policy:** If an intermediate step filters out all records (yielding 0 rows), subsequent steps **continue to validate and transform their column schemas deterministically**. For example, referencing a nonexistent column in a `select_columns` or `rename_columns` step after an empty filter will cleanly fail the workflow run and record step audit history through that failure point. Non-empty and empty pipelines both maintain deterministic column tracking.
+
+### Workflow Execution Example (cURL)
+
+**PowerShell:**
+```powershell
+# 1. Define a workflow
+$wfBody = @{
+    name = "Filter Admins"
+    steps = @(
+        @{ op = "select_columns"; columns = @("id", "username", "role") },
+        @{ op = "rename_columns"; mapping = @{ username = "handle" } },
+        @{ op = "filter_equals"; column = "role"; value = "admin" }
+    )
+} | ConvertTo-Json -Depth 5
+
+$wf = Invoke-RestMethod -Uri "http://127.0.0.1:8001/api/v1/workflows/" `
+    -Method Post -Headers @{ Authorization = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("devuser:devpass123")) } `
+    -ContentType "application/json" -Body $wfBody
+
+# 2. Execute against completed job
+$runBody = @{ source_job_id = "<job_uuid>" } | ConvertTo-Json
+$run = Invoke-RestMethod -Uri "http://127.0.0.1:8001/api/v1/workflows/$($wf.id)/runs/" `
+    -Method Post -Headers @{ Authorization = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("devuser:devpass123")) } `
+    -ContentType "application/json" -Body $runBody
+
+# 3. Retrieve run details & step history
+Invoke-RestMethod -Uri "http://127.0.0.1:8001/api/v1/workflow-runs/$($run.id)/" `
+    -Method Get -Headers @{ Authorization = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("devuser:devpass123")) }
+```
+
+**Bash / Linux / macOS:**
+```bash
+# 1. Define a workflow
+WF_ID=$(curl -s -X POST http://127.0.0.1:8001/api/v1/workflows/ \
+  -u devuser:devpass123 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Filter Admins",
+    "steps": [
+      {"op": "select_columns", "columns": ["id", "username", "role"]},
+      {"op": "rename_columns", "mapping": {"username": "handle"}},
+      {"op": "filter_equals", "column": "role", "value": "admin"}
+    ]
+  }' | jq -r .id)
+
+# 2. Execute against completed job
+RUN_ID=$(curl -s -X POST http://127.0.0.1:8001/api/v1/workflows/${WF_ID}/runs/ \
+  -u devuser:devpass123 \
+  -H "Content-Type: application/json" \
+  -d '{"source_job_id": "<job_uuid>"}' | jq -r .id)
+
+# 3. Retrieve run details & step history
+curl -s -X GET http://127.0.0.1:8001/api/v1/workflow-runs/${RUN_ID}/ \
+  -u devuser:devpass123 | jq .
 ```
 
 ---
