@@ -36,9 +36,12 @@ def execute_workflow_run(
     input_data = source_job.output_data or []
     initial_input_row_count = len(input_data)
     step_snapshot = list(workflow_def.steps)
+    initial_schema = source_job.column_names or (list(input_data[0].keys()) if input_data else [])
 
     try:
-        output_data, step_audits = execute_workflow_pipeline(input_data, step_snapshot)
+        output_data, step_audits = execute_workflow_pipeline(
+            input_data, step_snapshot, schema=initial_schema
+        )
 
         with transaction.atomic():
             run = WorkflowRun.objects.create(

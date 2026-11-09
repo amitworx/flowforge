@@ -247,10 +247,12 @@ FlowForge provides a synchronous, deterministic workflow execution engine that r
    ```json
    {"op": "rename_columns", "mapping": {"username": "handle"}}
    ```
-3. `filter_equals`: Performs exact scalar comparison (`string`, `int`, `float`, `bool`, or `null`).
+3. `filter_equals`: Performs strict, type-sensitive scalar comparison (`string`, `int`, `float`, `bool`, or `null`).
    ```json
    {"op": "filter_equals", "column": "role", "value": "admin"}
    ```
+   - **Type Sensitivity Policy:** In standard Python, `True == 1` and `False == 0` evaluate to True. FlowForge's engine strictly prevents this: boolean `True`/`False` values never match numeric `1`/`0`. Numeric comparison between `int` and `float` is supported (e.g. `1 == 1.0`). `null` (None) strictly matches only `null`. String values preserve exact formatting, leading zeros, and casing.
+   - **Empty Result & Schema Propagation Policy:** If an intermediate step filters out all records (yielding 0 rows), subsequent steps **continue to validate and transform their column schemas deterministically**. For example, referencing a nonexistent column in a `select_columns` or `rename_columns` step after an empty filter will cleanly fail the workflow run and record step audit history through that failure point. Non-empty and empty pipelines both maintain deterministic column tracking.
 
 ### Workflow Execution Example (cURL)
 
