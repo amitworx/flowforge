@@ -331,13 +331,13 @@ flowchart LR
 ```
 
 ### Architecture & Safety Invariants
-- **Opt-in Endpoint:** Asynchronous execution is requested via `POST /api/v1/workflows/{uuid}/runs/async/`. It returns HTTP `202 Accepted` with state `"queued"` and status polling URL.
-- **Transactional Enqueue & Broker Fault Tolerance:** Tasks are queued via `transaction.on_commit()`. If message broker publication fails (e.g. Redis temporarily unreachable), the run's `dispatch_status` is updated to `"failed"` with a safe notification, ensuring the run is not lost and remains eligible for background recovery.
+- **Opt-in Endpoint:** Asynchronous execution is requested via `POST /api/v1/workflows/{uuid}/runs/async/`. When dispatch succeeds, it returns HTTP `202 Accepted` with state `"queued"` and status polling URL.
+- **Truthful Broker Dispatch & Fault Tolerance:** Direct broker publish failures (e.g., Redis down during `POST`) return HTTP `503 Service Unavailable` with recoverable metadata (`id`, `status_url`, `dispatch_status: "failed"`). The run is committed in PostgreSQL and can be recovered by the background recovery command without losing intent or returning misleading `202 Accepted`.
 - **Minimal Celery Payloads:** Celery messages carry strictly the database `run_id` and fencing token (never file content or user payloads).
-- **Worker Claim Atomicity & Fencing:** Workers conditionally claim runs (`UPDATE ... WHERE state='queued'`). Workers generate and check a unique `claim_token` fencing identifier on state transitions. If a run was reclaimed after timing out, a zombie worker's results are cleanly dropped.
+- **Worker Claim Atomicity & Anti-Steal Fencing:** Workers conditionally claim runs (`UPDATE ... WHERE state='queued'`). Legitimately running tasks cannot be stolen by concurrent workers or duplicate delivery messages. A worker validates fencing tokens upon state updates; if a run was reclaimed after timing out, a zombie worker's results are cleanly rejected.
 - **Pre-execution Invariant Checks:** Workers independently verify that `run.owner == source_job.owner == workflow_definition.owner`, that `source_job.state == "completed"`, and that `step_snapshot` is a valid step definition list before executing pipeline operations. Mismatched or invalid inputs abort into a safe `FAILED` state.
-- **Internal Error Sanitization:** Unexpected worker crashes log the complete traceback server-side and present a safe, generic `error_summary` (`"Internal workflow execution error occurred."`) to API callers, ensuring raw database errors, socket exceptions, or system credentials are never exposed via the API.
-- **Recovery Management Command:** An explicit management command `python manage.py recover_workflow_runs` recovers stranded runs (`dispatch_status='failed'` or stale `running` runs beyond a configurable timeout) using fencing token rotation.
+- **Internal Error Sanitization:** Unexpected worker crashes or broker connection errors log the complete traceback server-side and present safe, generic messages (e.g. `"Internal workflow execution error occurred."` or `"Broker unavailable during async dispatch. Run is recoverable."`) to API callers, ensuring raw database passwords, hostnames, or socket exceptions are never exposed via the API.
+- **Bounded Recovery Management Command:** An explicit management command `python manage.py recover_workflow_runs` recovers stranded runs (`dispatch_status='failed'` or stale `running` runs beyond a configurable timeout). It enforces `--max-attempts` (default: 3) to prevent infinite retry loops; once exhausted, runs transition terminally to `FAILED`. Recovery dispatch failures are caught cleanly, persisting safe recoverable state.
 - **Snapshot Execution:** Workers execute against the immutable `step_snapshot` persisted on `WorkflowRun`, ensuring subsequent mutations to `WorkflowDefinition` do not affect in-flight runs.
 - **Isolated Redis Network:** Redis in `docker-compose.yml` does **not** expose host ports; it is accessible solely across the internal Docker Compose bridge network.
 
@@ -345,10 +345,10 @@ flowchart LR
 To reconcile stranded runs (e.g., after temporary Redis downtime or worker host termination):
 ```bash
 # Docker Compose
-docker compose exec web python manage.py recover_workflow_runs --stale-minutes=15 --limit=50 --action=requeue
+docker compose exec web python manage.py recover_workflow_runs --stale-minutes=15 --max-attempts=3 --limit=50 --action=requeue
 
 # Local
-python manage.py recover_workflow_runs --stale-minutes=15 --limit=50 --action=requeue
+python manage.py recover_workflow_runs --stale-minutes=15 --max-attempts=3 --limit=50 --action=requeue
 ```
 
 ### cURL / PowerShell Examples

@@ -143,6 +143,8 @@ class WorkflowExecuteAsyncRunView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        dispatch_error = None
+
         with transaction.atomic():
             run = WorkflowRun.objects.create(
                 owner=request.user,
@@ -155,19 +157,32 @@ class WorkflowExecuteAsyncRunView(APIView):
                 output_row_count=0,
             )
 
-            def _dispatch_task(run_id: str):
+            def _publish():
+                nonlocal dispatch_error
                 try:
-                    execute_workflow_run_task.delay(run_id, None)
-                except Exception:
+                    execute_workflow_run_task.delay(str(run.id), None)
+                except Exception as exc:
+                    dispatch_error = exc
                     logger.exception(
-                        "Failed to publish task to Celery broker for WorkflowRun %s", run_id
+                        "Failed to publish task to Celery broker for WorkflowRun %s", run.id
                     )
-                    WorkflowRun.objects.filter(id=run_id).update(
+                    WorkflowRun.objects.filter(id=run.id).update(
                         dispatch_status=WorkflowRun.DispatchStatus.FAILED,
                         error_summary="Broker unavailable during async dispatch. Run is recoverable.",
                     )
 
-            transaction.on_commit(lambda: _dispatch_task(str(run.id)))
+            transaction.on_commit(_publish)
+
+        if dispatch_error is not None:
+            run.refresh_from_db()
+            response_serializer = WorkflowAsyncRunResponseSerializer(run)
+            return Response(
+                {
+                    **response_serializer.data,
+                    "detail": "Broker unavailable; async dispatch deferred. Run recorded for recovery.",
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
 
         response_serializer = WorkflowAsyncRunResponseSerializer(run)
         return Response(response_serializer.data, status=status.HTTP_202_ACCEPTED)

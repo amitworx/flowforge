@@ -34,11 +34,15 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
     now = timezone.now()
 
     # Atomic claim:
-    # 1. Either state is QUEUED (claim_token can be null or match)
-    # 2. Or state is RUNNING and claim_token matches the expected claim_token passed in
+    # 1. State must be QUEUED (not already claimed by another worker)
+    # 2. Or, if claim_token is explicitly provided (via recovery command rotation),
+    #    state can be QUEUED with that specific claim_token
     claim_q = models.Q(id=run_id, state=WorkflowRun.State.QUEUED)
     if claim_token:
-        claim_q |= models.Q(id=run_id, state=WorkflowRun.State.RUNNING, claim_token=claim_token)
+        claim_q &= models.Q(claim_token__isnull=True) | models.Q(claim_token=claim_token)
+    else:
+        # Standard first-time dispatch: claim_token must be NULL or fresh
+        claim_q &= models.Q(claim_token__isnull=True)
 
     updated = WorkflowRun.objects.filter(claim_q).update(
         state=WorkflowRun.State.RUNNING,

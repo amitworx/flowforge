@@ -97,11 +97,13 @@ def test_broker_publish_failure_handling(auth_client, completed_source_job, samp
     ):
         response = client.post(url, payload, format="json")
 
-    assert response.status_code == status.HTTP_202_ACCEPTED
+    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
     data = response.json()
     assert "id" in data
+    assert data["dispatch_status"] == WorkflowRun.DispatchStatus.FAILED
+    assert "detail" in data
 
-    # The on_commit hook caught broker exception and safely persisted FAILED dispatch status
+    # The view caught broker exception and safely persisted FAILED dispatch status
     run = WorkflowRun.objects.get(id=data["id"])
     assert run.state == WorkflowRun.State.QUEUED
     assert run.dispatch_status == WorkflowRun.DispatchStatus.FAILED

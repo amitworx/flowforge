@@ -23,6 +23,12 @@ class Command(BaseCommand):
             help="Minutes after which a running workflow run without completion is considered stale.",
         )
         parser.add_argument(
+            "--max-attempts",
+            type=int,
+            default=3,
+            help="Maximum dispatch attempts before marking a dispatch-failed run as terminally FAILED.",
+        )
+        parser.add_argument(
             "--limit",
             type=int,
             default=50,
@@ -38,13 +44,14 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):  # noqa: ARG002
         stale_minutes = options["stale_minutes"]
+        max_attempts = options["max_attempts"]
         limit = options["limit"]
         action = options["action"]
         now = timezone.now()
         stale_threshold = now - timedelta(minutes=stale_minutes)
 
         self.stdout.write(
-            f"Starting workflow run recovery (stale threshold: {stale_minutes}m, limit: {limit})..."
+            f"Starting workflow run recovery (stale threshold: {stale_minutes}m, max attempts: {max_attempts}, limit: {limit})..."
         )
 
         # 1. Recover DISPATCH_FAILED runs
@@ -56,7 +63,29 @@ class Command(BaseCommand):
         )
 
         recovered_dispatch_count = 0
+        terminal_failed_count = 0
+
         for run in dispatch_failed_runs:
+            if run.dispatch_attempts >= max_attempts:
+                # Terminal failure: max retry attempts exhausted
+                updated = WorkflowRun.objects.filter(
+                    id=run.id,
+                    state=WorkflowRun.State.QUEUED,
+                    dispatch_status=WorkflowRun.DispatchStatus.FAILED,
+                ).update(
+                    state=WorkflowRun.State.FAILED,
+                    error_summary=f"Recovery attempts exhausted (reached max attempts: {max_attempts}).",
+                    finished_at=now,
+                )
+                if updated > 0:
+                    terminal_failed_count += 1
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Run {run.id} exhausted {max_attempts} attempts. Marked terminal FAILED."
+                        )
+                    )
+                continue
+
             with transaction.atomic():
                 run.dispatch_attempts += 1
                 run.dispatch_status = WorkflowRun.DispatchStatus.DISPATCHED
@@ -73,11 +102,16 @@ class Command(BaseCommand):
                         f"Re-dispatched failed run {run.id} (attempt {run.dispatch_attempts})."
                     )
                 )
-            except Exception as exc:
+            except Exception:
+                logger.exception("Failed to re-dispatch run %s to broker during recovery", run.id)
                 run.dispatch_status = WorkflowRun.DispatchStatus.FAILED
-                run.error_summary = f"Broker unavailable during recovery dispatch: {str(exc)}"
+                run.error_summary = (
+                    "Broker unavailable during recovery dispatch. Run is recoverable."
+                )
                 run.save(update_fields=["dispatch_status", "error_summary"])
-                self.stdout.write(self.style.ERROR(f"Failed to re-dispatch run {run.id}: {exc}"))
+                self.stdout.write(
+                    self.style.ERROR(f"Failed to re-dispatch run {run.id}: broker unavailable.")
+                )
 
         # 2. Recover stale RUNNING runs
         stale_running_runs = list(
@@ -102,11 +136,23 @@ class Command(BaseCommand):
                     error_summary="Recovered from stale running state.",
                 )
                 if updated > 0:
-                    execute_workflow_run_task.delay(str(run.id), str(new_fencing_token))
-                    recovered_running_count += 1
-                    self.stdout.write(
-                        self.style.SUCCESS(f"Reclaimed and requeued stale run {run.id}.")
-                    )
+                    try:
+                        execute_workflow_run_task.delay(str(run.id), str(new_fencing_token))
+                        recovered_running_count += 1
+                        self.stdout.write(
+                            self.style.SUCCESS(f"Reclaimed and requeued stale run {run.id}.")
+                        )
+                    except Exception:
+                        logger.exception("Failed to dispatch reclaimed run %s to broker", run.id)
+                        WorkflowRun.objects.filter(id=run.id).update(
+                            dispatch_status=WorkflowRun.DispatchStatus.FAILED,
+                            error_summary="Broker unavailable during stale run recovery.",
+                        )
+                        self.stdout.write(
+                            self.style.ERROR(
+                                f"Failed to dispatch reclaimed run {run.id}: broker unavailable."
+                            )
+                        )
             else:
                 updated = WorkflowRun.objects.filter(
                     id=run.id,
@@ -127,6 +173,6 @@ class Command(BaseCommand):
         self.stdout.write(
             self.style.SUCCESS(
                 f"Recovery complete. Recovered {recovered_dispatch_count} dispatch-failed runs, "
-                f"{recovered_running_count} stale running runs."
+                f"{terminal_failed_count} marked terminal failed, {recovered_running_count} stale running runs."
             )
         )
