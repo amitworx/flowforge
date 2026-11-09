@@ -56,7 +56,7 @@ def detect_file_type(filename: str, initial_bytes: bytes) -> str:
 
     if not (is_json_ext or is_csv_ext):
         raise IngestionError(
-            f"Unsupported file extension for '{filename}'. Only .csv and .json files are accepted."
+            f"Unsupported file type for '{filename}'. Only CSV (.csv) and JSON (.json) files are accepted."
         )
 
     # Check for JSON syntax markers
