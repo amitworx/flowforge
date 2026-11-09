@@ -36,7 +36,8 @@ FlowForge is an open-source, self-hostable Python document-processing and workfl
 - Create workflow definition: `POST /api/v1/workflows/` (Authenticated)
 - List workflow definitions: `GET /api/v1/workflows/` (Authenticated)
 - Retrieve workflow definition: `GET /api/v1/workflows/{uuid}/` (Authenticated)
-- Execute workflow run: `POST /api/v1/workflows/{uuid}/runs/` (Authenticated)
+- Execute workflow run: `POST /api/v1/workflows/{uuid}/runs/` (Authenticated, Synchronous)
+- Enqueue async workflow run: `POST /api/v1/workflows/{uuid}/runs/async/` (Authenticated, Asynchronous)
 - List workflow runs: `GET /api/v1/workflow-runs/` (Authenticated)
 - Retrieve workflow run details: `GET /api/v1/workflow-runs/{uuid}/` (Authenticated)
 
@@ -307,6 +308,68 @@ RUN_ID=$(curl -s -X POST http://127.0.0.1:8001/api/v1/workflows/${WF_ID}/runs/ \
 # 3. Retrieve run details & step history
 curl -s -X GET http://127.0.0.1:8001/api/v1/workflow-runs/${RUN_ID}/ \
   -u devuser:devpass123 | jq .
+```
+
+---
+
+## Asynchronous Workflow Execution with Celery & Redis (M0-004)
+
+FlowForge provides opt-in asynchronous execution of workflows using Celery and Redis while strictly preserving the synchronous execution endpoint unchanged.
+
+```mermaid
+flowchart LR
+    Client["Client / API Caller"] -->|"POST /workflows/{id}/runs/async/"| API["FlowForge Web API"]
+    API -->|"1. Validate ownership & status"| DB[("PostgreSQL")]
+    API -->|"2. Create WorkflowRun (queued)"| DB
+    API -->|"3. transaction.on_commit(delay)"| Broker[("Redis Broker (Internal)")]
+    API -->|"4. HTTP 202 Accepted"| Client
+    Worker["Celery Worker"] -->|"5. Consume task"| Broker
+    Worker -->|"6. Atomic claim (queued -> running)"| DB
+    Worker -->|"7. Execute step_snapshot"| Engine["Workflow Pipeline Engine"]
+    Worker -->|"8. Persist completed/failed & audits"| DB
+    Client -->|"9. GET /workflow-runs/{id}/"| API
+```
+
+### Architecture & Safety Invariants
+- **Opt-in Endpoint:** Asynchronous execution is requested via `POST /api/v1/workflows/{uuid}/runs/async/`. It returns HTTP `202 Accepted` with state `"queued"` and status polling URL.
+- **Transactional Enqueue:** Tasks are dispatched only after transaction commit using `django.db.transaction.on_commit`.
+- **Minimal Celery Payloads:** Celery messages carry strictly the database `run_id` (never file content or user payloads).
+- **Worker Claim Atomicity:** Workers conditionally claim runs (`UPDATE ... WHERE state='queued'`). If already claimed or processed, redundant delivery does not duplicate work.
+- **Snapshot Execution:** Workers execute against the immutable `step_snapshot` persisted on `WorkflowRun`, ensuring subsequent mutations to `WorkflowDefinition` do not affect in-flight runs.
+- **Isolated Redis Network:** Redis in `docker-compose.yml` does **not** expose host ports; it is accessible solely across the internal Docker Compose bridge network.
+
+### cURL / PowerShell Examples
+
+#### Enqueue Asynchronous Workflow Run
+```bash
+curl -s -X POST http://127.0.0.1:8001/api/v1/workflows/<workflow_uuid>/runs/async/ \
+  -u devuser:devpass123 \
+  -H "Content-Type: application/json" \
+  -d '{"source_job_id": "<source_job_uuid>"}' | jq .
+```
+
+**Response (`202 Accepted`):**
+```json
+{
+  "id": "c1f77d54-159e-4c57-814c-e83cb2b6a506",
+  "workflow_definition": "8eab8562-99b7-4b66-ba65-71694096fe00",
+  "source_job": "6e1cf1d0-8695-494b-ba84-f6cbcd2f040f",
+  "state": "queued",
+  "status_url": "/api/v1/workflow-runs/c1f77d54-159e-4c57-814c-e83cb2b6a506/",
+  "created_at": "2026-11-09T09:40:00.123456Z"
+}
+```
+
+#### Poll Workflow Run Status
+```bash
+curl -s -X GET http://127.0.0.1:8001/api/v1/workflow-runs/<run_uuid>/ \
+  -u devuser:devpass123 | jq .
+```
+
+```powershell
+# PowerShell
+Invoke-RestMethod -Uri "http://127.0.0.1:8001/api/v1/workflow-runs/<run_uuid>/" `
+  -Headers @{ Authorization = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("devuser:devpass123")) }
 ```
 
 ---

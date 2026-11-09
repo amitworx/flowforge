@@ -50,6 +50,7 @@ class WorkflowRunListSerializer(serializers.ModelSerializer):
             "output_row_count",
             "error_summary",
             "created_at",
+            "started_at",
             "finished_at",
         ]
 
@@ -70,6 +71,7 @@ class WorkflowRunDetailSerializer(serializers.ModelSerializer):
             "output_row_count",
             "error_summary",
             "created_at",
+            "started_at",
             "finished_at",
             "step_runs",
         ]
@@ -77,3 +79,21 @@ class WorkflowRunDetailSerializer(serializers.ModelSerializer):
 
 class WorkflowRunCreateSerializer(serializers.Serializer):
     source_job_id = serializers.UUIDField(required=True)
+
+
+class WorkflowAsyncRunResponseSerializer(serializers.ModelSerializer):
+    status_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = WorkflowRun
+        fields = [
+            "id",
+            "workflow_definition",
+            "source_job",
+            "state",
+            "status_url",
+            "created_at",
+        ]
+
+    def get_status_url(self, obj: WorkflowRun) -> str:
+        return f"/api/v1/workflow-runs/{obj.id}/"

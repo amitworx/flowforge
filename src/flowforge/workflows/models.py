@@ -35,6 +35,8 @@ class WorkflowRun(models.Model):
     """
 
     class State(models.TextChoices):
+        QUEUED = "queued", "Queued"
+        RUNNING = "running", "Running"
         COMPLETED = "completed", "Completed"
         FAILED = "failed", "Failed"
 
@@ -70,6 +72,7 @@ class WorkflowRun(models.Model):
     output_row_count = models.PositiveIntegerField(default=0)
     error_summary = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:

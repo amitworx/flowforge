@@ -13,12 +13,15 @@ authors = [
     { name = "FlowForge Contributors" }
 ]
 dependencies = [
+    "celery>=5.4.0,<6.0.0",
     "Django>=5.2,<6.0",
     "djangorestframework>=3.18.0,<4.0.0",
+    "packaging>=24.0",
     "psycopg[binary]>=3.2.0,<4.0.0",
     "pydantic>=2.10.0,<3.0.0",
     "pydantic-settings>=2.8.0,<3.0.0",
     "python-dotenv>=1.0.1",
+    "redis>=6.1.0,<9.0.0",
 ]
 
 [project.optional-dependencies]
