@@ -337,7 +337,12 @@ flowchart LR
 - **Worker Claim Atomicity & Anti-Steal Fencing:** Workers conditionally claim runs (`UPDATE ... WHERE state='queued'`). Legitimately running tasks cannot be stolen by concurrent workers or duplicate delivery messages. A worker validates fencing tokens upon state updates; if a run was reclaimed after timing out, a zombie worker's results are cleanly rejected.
 - **Pre-execution Invariant Checks:** Workers independently verify that `run.owner == source_job.owner == workflow_definition.owner`, that `source_job.state == "completed"`, and that `step_snapshot` is a valid step definition list before executing pipeline operations. Mismatched or invalid inputs abort into a safe `FAILED` state.
 - **Internal Error Sanitization:** Unexpected worker crashes or broker connection errors log the complete traceback server-side and present safe, generic messages (e.g. `"Internal workflow execution error occurred."` or `"Broker unavailable during async dispatch. Run is recoverable."`) to API callers, ensuring raw database passwords, hostnames, or socket exceptions are never exposed via the API.
-- **Bounded Recovery Management Command:** An explicit management command `python manage.py recover_workflow_runs` recovers stranded runs (`dispatch_status='failed'` or stale `running` runs beyond a configurable timeout). It enforces `--max-attempts` (default: 3) to prevent infinite retry loops; once exhausted, runs transition terminally to `FAILED`. Recovery dispatch failures are caught cleanly, persisting safe recoverable state.
+- **Concurrency-Safe Bounded Recovery Policy:** An explicit management command `python manage.py recover_workflow_runs` recovers stranded runs (`dispatch_status='failed'` or abandoned `queued` dispatches, as well as stale `running` runs beyond `--stale-minutes`). Recovery features:
+  - **Atomic Row Reservation:** Uses `select_for_update(skip_locked=True)` so concurrent recovery invocations never double-claim or race to increment dispatch attempt counters.
+  - **Bounded Attempt Budget:** Applies a strict `--max-attempts` budget across both dispatch failures and stale-running recoveries. Runs exceeding the threshold transition terminally to `FAILED` and are fenced against zombie workers.
+  - **Exponential Backoff:** Dispatches observe exponential backoff (`base * 2^(attempt - 2)`, default base 15s, capped at 15m) to prevent aggressive retry thrashing. An `--ignore-backoff` flag is provided for testing or operator overrides.
+  - **Unacknowledged Queued Detection:** Detects runs stranded in `queued` state with `dispatch_status=dispatched` after crash events exceeding the age threshold.
+  - **Argument Validation:** Enforces positive integers for `--max-attempts`, `--stale-minutes`, and `--limit`.
 - **Snapshot Execution:** Workers execute against the immutable `step_snapshot` persisted on `WorkflowRun`, ensuring subsequent mutations to `WorkflowDefinition` do not affect in-flight runs.
 - **Isolated Redis Network:** Redis in `docker-compose.yml` does **not** expose host ports; it is accessible solely across the internal Docker Compose bridge network.
 
@@ -347,7 +352,7 @@ To reconcile stranded runs (e.g., after temporary Redis downtime or worker host 
 # Docker Compose
 docker compose exec web python manage.py recover_workflow_runs --stale-minutes=15 --max-attempts=3 --limit=50 --action=requeue
 
-# Local
+# Local (with optional --ignore-backoff for immediate emergency reconciliations)
 python manage.py recover_workflow_runs --stale-minutes=15 --max-attempts=3 --limit=50 --action=requeue
 ```
 

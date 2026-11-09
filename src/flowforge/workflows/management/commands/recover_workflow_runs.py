@@ -2,14 +2,26 @@ import logging
 import uuid
 from datetime import timedelta
 
-from django.core.management.base import BaseCommand
-from django.db import transaction
+from django.core.management.base import BaseCommand, CommandError
+from django.db import models, transaction
 from django.utils import timezone
 
 from flowforge.workflows.models import WorkflowRun
 from flowforge.workflows.tasks import execute_workflow_run_task
 
 logger = logging.getLogger(__name__)
+
+
+def calculate_backoff_seconds(attempt: int, base: int = 15, max_seconds: int = 900) -> int:
+    """
+    Exponential backoff in seconds based on attempt number: base * 2^(attempt - 2), capped at max_seconds.
+    Attempt 1 (initial run failure) has 0s backoff (immediate retry eligible).
+    Attempt 2 has 15s backoff, Attempt 3 has 30s, Attempt 4 has 60s, etc.
+    """
+    if attempt <= 1:
+        return 0
+    delay = base * (2 ** (attempt - 2))
+    return min(delay, max_seconds)
 
 
 class Command(BaseCommand):
@@ -20,13 +32,13 @@ class Command(BaseCommand):
             "--stale-minutes",
             type=int,
             default=15,
-            help="Minutes after which a running workflow run without completion is considered stale.",
+            help="Minutes after which a running or unacknowledged queued run is considered stale.",
         )
         parser.add_argument(
             "--max-attempts",
             type=int,
             default=3,
-            help="Maximum dispatch attempts before marking a dispatch-failed run as terminally FAILED.",
+            help="Maximum dispatch/recovery attempts before marking a run as terminally FAILED.",
         )
         parser.add_argument(
             "--limit",
@@ -41,12 +53,27 @@ class Command(BaseCommand):
             default="requeue",
             help="Action to take on stale running runs: 'requeue' (rotate claim token and redispatch) or 'fail'.",
         )
+        parser.add_argument(
+            "--ignore-backoff",
+            action="store_true",
+            default=False,
+            help="Ignore exponential backoff delay (primarily for testing and urgent administrative overrides).",
+        )
 
     def handle(self, *args, **options):  # noqa: ARG002
         stale_minutes = options["stale_minutes"]
         max_attempts = options["max_attempts"]
         limit = options["limit"]
         action = options["action"]
+        ignore_backoff = options["ignore_backoff"]
+
+        if stale_minutes <= 0:
+            raise CommandError("--stale-minutes must be positive.")
+        if max_attempts <= 0:
+            raise CommandError("--max-attempts must be positive.")
+        if limit <= 0:
+            raise CommandError("--limit must be positive.")
+
         now = timezone.now()
         stale_threshold = now - timedelta(minutes=stale_minutes)
 
@@ -54,24 +81,34 @@ class Command(BaseCommand):
             f"Starting workflow run recovery (stale threshold: {stale_minutes}m, max attempts: {max_attempts}, limit: {limit})..."
         )
 
-        # 1. Recover DISPATCH_FAILED runs
-        dispatch_failed_runs = list(
+        recovered_dispatch_count = 0
+        terminal_failed_count = 0
+        recovered_running_count = 0
+
+        # 1. Recover stranded QUEUED runs:
+        # a) dispatch_status == FAILED
+        # b) dispatch_status == DISPATCHED but created_at < stale_threshold (crashed before publish)
+        # We query the candidates with their specific conditions
+        candidate_queued_runs = list(
             WorkflowRun.objects.filter(
-                state=WorkflowRun.State.QUEUED,
-                dispatch_status=WorkflowRun.DispatchStatus.FAILED,
+                models.Q(state=WorkflowRun.State.QUEUED)
+                & (
+                    models.Q(dispatch_status=WorkflowRun.DispatchStatus.FAILED)
+                    | (
+                        models.Q(dispatch_status=WorkflowRun.DispatchStatus.DISPATCHED)
+                        & models.Q(created_at__lt=stale_threshold)
+                    )
+                )
             ).order_by("created_at")[:limit]
         )
 
-        recovered_dispatch_count = 0
-        terminal_failed_count = 0
-
-        for run in dispatch_failed_runs:
-            if run.dispatch_attempts >= max_attempts:
+        for candidate in candidate_queued_runs:
+            # Check attempt budget first
+            if candidate.dispatch_attempts >= max_attempts:
                 # Terminal failure: max retry attempts exhausted
                 updated = WorkflowRun.objects.filter(
-                    id=run.id,
+                    id=candidate.id,
                     state=WorkflowRun.State.QUEUED,
-                    dispatch_status=WorkflowRun.DispatchStatus.FAILED,
                 ).update(
                     state=WorkflowRun.State.FAILED,
                     error_summary=f"Recovery attempts exhausted (reached max attempts: {max_attempts}).",
@@ -81,82 +118,193 @@ class Command(BaseCommand):
                     terminal_failed_count += 1
                     self.stdout.write(
                         self.style.WARNING(
-                            f"Run {run.id} exhausted {max_attempts} attempts. Marked terminal FAILED."
+                            f"Run {candidate.id} exhausted {max_attempts} attempts. Marked terminal FAILED."
                         )
                     )
                 continue
 
+            # Exponential backoff check:
+            # Measure time since last activity (started_at or created_at)
+            last_activity = candidate.started_at or candidate.created_at
+            if not ignore_backoff and last_activity:
+                backoff_secs = calculate_backoff_seconds(candidate.dispatch_attempts)
+                if (now - last_activity).total_seconds() < backoff_secs:
+                    # Not yet eligible for retry
+                    continue
+
+            # Concurrency-safe atomic reservation using row locking inside atomic transaction
+            reserved_run = None
             with transaction.atomic():
+                locked_runs = list(
+                    WorkflowRun.objects.select_for_update(skip_locked=True)
+                    .filter(
+                        id=candidate.id,
+                        state=WorkflowRun.State.QUEUED,
+                    )
+                    .filter(
+                        # Must still be eligible (e.g. not already reserved/dispatched by another thread)
+                        models.Q(dispatch_status=WorkflowRun.DispatchStatus.FAILED)
+                        | (
+                            models.Q(dispatch_status=WorkflowRun.DispatchStatus.DISPATCHED)
+                            & models.Q(created_at__lt=stale_threshold)
+                        )
+                    )
+                )
+                if not locked_runs:
+                    continue  # Already claimed or reserved by another worker/command
+
+                run = locked_runs[0]
+                if run.dispatch_attempts >= max_attempts:
+                    run.state = WorkflowRun.State.FAILED
+                    run.error_summary = (
+                        f"Recovery attempts exhausted (reached max attempts: {max_attempts})."
+                    )
+                    run.finished_at = now
+                    run.save(update_fields=["state", "error_summary", "finished_at"])
+                    terminal_failed_count += 1
+                    continue
+
                 run.dispatch_attempts += 1
                 run.dispatch_status = WorkflowRun.DispatchStatus.DISPATCHED
                 run.error_summary = None
-                run.save(update_fields=["dispatch_attempts", "dispatch_status", "error_summary"])
+                run.started_at = now
+                run.save(
+                    update_fields=[
+                        "dispatch_attempts",
+                        "dispatch_status",
+                        "error_summary",
+                        "started_at",
+                    ]
+                )
+                reserved_run = run
 
-            try:
-                execute_workflow_run_task.delay(
-                    str(run.id), str(run.claim_token) if run.claim_token else None
-                )
-                recovered_dispatch_count += 1
-                self.stdout.write(
-                    self.style.SUCCESS(
-                        f"Re-dispatched failed run {run.id} (attempt {run.dispatch_attempts})."
+            # Post-commit dispatch to Celery broker
+            if reserved_run:
+                try:
+                    execute_workflow_run_task.delay(
+                        str(reserved_run.id),
+                        str(reserved_run.claim_token) if reserved_run.claim_token else None,
                     )
-                )
-            except Exception:
-                logger.exception("Failed to re-dispatch run %s to broker during recovery", run.id)
-                run.dispatch_status = WorkflowRun.DispatchStatus.FAILED
-                run.error_summary = (
-                    "Broker unavailable during recovery dispatch. Run is recoverable."
-                )
-                run.save(update_fields=["dispatch_status", "error_summary"])
-                self.stdout.write(
-                    self.style.ERROR(f"Failed to re-dispatch run {run.id}: broker unavailable.")
-                )
+                    recovered_dispatch_count += 1
+                    self.stdout.write(
+                        self.style.SUCCESS(
+                            f"Re-dispatched failed run {reserved_run.id} (attempt {reserved_run.dispatch_attempts})."
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to re-dispatch run %s to broker during recovery", reserved_run.id
+                    )
+                    WorkflowRun.objects.filter(id=reserved_run.id).update(
+                        dispatch_status=WorkflowRun.DispatchStatus.FAILED,
+                        error_summary="Broker unavailable during recovery dispatch. Run is recoverable.",
+                    )
+                    self.stdout.write(
+                        self.style.ERROR(
+                            f"Failed to re-dispatch run {reserved_run.id}: broker unavailable."
+                        )
+                    )
 
         # 2. Recover stale RUNNING runs
-        stale_running_runs = list(
+        candidate_running_runs = list(
             WorkflowRun.objects.filter(
                 state=WorkflowRun.State.RUNNING,
                 started_at__lt=stale_threshold,
             ).order_by("started_at")[:limit]
         )
 
-        recovered_running_count = 0
-        for run in stale_running_runs:
-            new_fencing_token = uuid.uuid4()
-            if action == "requeue":
-                # Reclaim by rotating fencing token and setting state back to QUEUED
+        for candidate in candidate_running_runs:
+            # Check total recovery/attempt budget including stale reclaims
+            if candidate.dispatch_attempts >= max_attempts:
+                # Terminal failure
                 updated = WorkflowRun.objects.filter(
-                    id=run.id,
-                    claim_token=run.claim_token,
+                    id=candidate.id,
+                    claim_token=candidate.claim_token,
                     state=WorkflowRun.State.RUNNING,
                 ).update(
-                    state=WorkflowRun.State.QUEUED,
-                    claim_token=new_fencing_token,
-                    error_summary="Recovered from stale running state.",
+                    state=WorkflowRun.State.FAILED,
+                    error_summary=f"Recovery attempts exhausted (reached max attempts: {max_attempts}).",
+                    finished_at=now,
                 )
                 if updated > 0:
+                    terminal_failed_count += 1
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"Stale run {candidate.id} exhausted {max_attempts} attempts. Marked terminal FAILED."
+                        )
+                    )
+                continue
+
+            new_fencing_token = uuid.uuid4()
+            if action == "requeue":
+                # Concurrency-safe atomic claim reservation
+                reserved_stale = None
+                with transaction.atomic():
+                    locked_stale = list(
+                        WorkflowRun.objects.select_for_update(skip_locked=True).filter(
+                            id=candidate.id,
+                            claim_token=candidate.claim_token,
+                            state=WorkflowRun.State.RUNNING,
+                        )
+                    )
+                    if not locked_stale:
+                        continue
+
+                    run = locked_stale[0]
+                    if run.dispatch_attempts >= max_attempts:
+                        run.state = WorkflowRun.State.FAILED
+                        run.error_summary = (
+                            f"Recovery attempts exhausted (reached max attempts: {max_attempts})."
+                        )
+                        run.finished_at = now
+                        run.save(update_fields=["state", "error_summary", "finished_at"])
+                        terminal_failed_count += 1
+                        continue
+
+                    run.dispatch_attempts += 1
+                    run.state = WorkflowRun.State.QUEUED
+                    run.claim_token = new_fencing_token
+                    run.error_summary = "Recovered from stale running state."
+                    run.started_at = now
+                    run.save(
+                        update_fields=[
+                            "dispatch_attempts",
+                            "state",
+                            "claim_token",
+                            "error_summary",
+                            "started_at",
+                        ]
+                    )
+                    reserved_stale = run
+
+                if reserved_stale:
                     try:
-                        execute_workflow_run_task.delay(str(run.id), str(new_fencing_token))
+                        execute_workflow_run_task.delay(
+                            str(reserved_stale.id), str(new_fencing_token)
+                        )
                         recovered_running_count += 1
                         self.stdout.write(
-                            self.style.SUCCESS(f"Reclaimed and requeued stale run {run.id}.")
+                            self.style.SUCCESS(
+                                f"Reclaimed and requeued stale run {reserved_stale.id} (attempt {reserved_stale.dispatch_attempts})."
+                            )
                         )
                     except Exception:
-                        logger.exception("Failed to dispatch reclaimed run %s to broker", run.id)
-                        WorkflowRun.objects.filter(id=run.id).update(
+                        logger.exception(
+                            "Failed to dispatch reclaimed run %s to broker", reserved_stale.id
+                        )
+                        WorkflowRun.objects.filter(id=reserved_stale.id).update(
                             dispatch_status=WorkflowRun.DispatchStatus.FAILED,
                             error_summary="Broker unavailable during stale run recovery.",
                         )
                         self.stdout.write(
                             self.style.ERROR(
-                                f"Failed to dispatch reclaimed run {run.id}: broker unavailable."
+                                f"Failed to dispatch reclaimed run {reserved_stale.id}: broker unavailable."
                             )
                         )
             else:
                 updated = WorkflowRun.objects.filter(
-                    id=run.id,
-                    claim_token=run.claim_token,
+                    id=candidate.id,
+                    claim_token=candidate.claim_token,
                     state=WorkflowRun.State.RUNNING,
                 ).update(
                     state=WorkflowRun.State.FAILED,
@@ -167,7 +315,7 @@ class Command(BaseCommand):
                 if updated > 0:
                     recovered_running_count += 1
                     self.stdout.write(
-                        self.style.WARNING(f"Marked timed-out run {run.id} as failed.")
+                        self.style.WARNING(f"Marked timed-out run {candidate.id} as failed.")
                     )
 
         self.stdout.write(
