@@ -40,6 +40,10 @@ class WorkflowRun(models.Model):
         COMPLETED = "completed", "Completed"
         FAILED = "failed", "Failed"
 
+    class DispatchStatus(models.TextChoices):
+        DISPATCHED = "dispatched", "Dispatched"
+        FAILED = "failed", "Failed"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     owner = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -60,6 +64,14 @@ class WorkflowRun(models.Model):
         max_length=20,
         choices=State.choices,
     )
+    dispatch_status = models.CharField(
+        max_length=20,
+        choices=DispatchStatus.choices,
+        default=DispatchStatus.DISPATCHED,
+        db_index=True,
+    )
+    dispatch_attempts = models.PositiveIntegerField(default=1)
+    claim_token = models.UUIDField(null=True, blank=True, db_index=True)
     step_snapshot = models.JSONField(
         help_text="Immutable snapshot of the steps executed in this run."
     )

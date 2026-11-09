@@ -1,3 +1,5 @@
+import logging
+
 from django.db import transaction
 from rest_framework import status
 from rest_framework.exceptions import NotFound
@@ -18,6 +20,8 @@ from flowforge.workflows.serializers import (
 )
 from flowforge.workflows.services import WorkflowServiceError, execute_workflow_run
 from flowforge.workflows.tasks import execute_workflow_run_task
+
+logger = logging.getLogger(__name__)
 
 
 class WorkflowDefinitionListCreateView(APIView):
@@ -103,7 +107,9 @@ class WorkflowExecuteAsyncRunView(APIView):
     """
     POST /api/v1/workflows/{uuid}/runs/async/
     Enqueues a background asynchronous run of a WorkflowDefinition against a ProcessingJob.
-    Returns HTTP 202 Accepted with state 'queued' and status URL.
+    Returns HTTP 202 Accepted with state 'queued' and status URL if dispatched,
+    or HTTP 503 Service Unavailable if message broker publication fails, preserving
+    a recoverable persisted WorkflowRun state.
     """
 
     permission_classes = [IsAuthenticated]
@@ -143,11 +149,25 @@ class WorkflowExecuteAsyncRunView(APIView):
                 workflow_definition=workflow_def,
                 source_job=source_job,
                 state=WorkflowRun.State.QUEUED,
+                dispatch_status=WorkflowRun.DispatchStatus.DISPATCHED,
                 step_snapshot=list(workflow_def.steps),
                 input_row_count=len(source_job.output_data or []),
                 output_row_count=0,
             )
-            transaction.on_commit(lambda: execute_workflow_run_task.delay(str(run.id)))
+
+            def _dispatch_task(run_id: str):
+                try:
+                    execute_workflow_run_task.delay(run_id, None)
+                except Exception:
+                    logger.exception(
+                        "Failed to publish task to Celery broker for WorkflowRun %s", run_id
+                    )
+                    WorkflowRun.objects.filter(id=run_id).update(
+                        dispatch_status=WorkflowRun.DispatchStatus.FAILED,
+                        error_summary="Broker unavailable during async dispatch. Run is recoverable.",
+                    )
+
+            transaction.on_commit(lambda: _dispatch_task(str(run.id)))
 
         response_serializer = WorkflowAsyncRunResponseSerializer(run)
         return Response(response_serializer.data, status=status.HTTP_202_ACCEPTED)

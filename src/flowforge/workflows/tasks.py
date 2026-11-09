@@ -1,47 +1,136 @@
 import logging
+import uuid
 
 from celery import shared_task
-from django.db import transaction
+from django.db import models, transaction
 from django.utils import timezone
 
-from flowforge.workflows.engine import WorkflowExecutionError, execute_workflow_pipeline
+from flowforge.processing.models import ProcessingJob
+from flowforge.workflows.engine import (
+    WorkflowExecutionError,
+    execute_workflow_pipeline,
+    validate_step_definitions,
+)
 from flowforge.workflows.models import WorkflowRun, WorkflowStepRun
 
 logger = logging.getLogger(__name__)
 
+GENERIC_INTERNAL_ERROR_MESSAGE = "Internal workflow execution error occurred."
+
 
 @shared_task(max_retries=0)
-def execute_workflow_run_task(run_id: str):
+def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
     """
     Celery background worker task for executing a WorkflowRun.
-    - Atomically claims the run from QUEUED -> RUNNING.
+    - Atomically claims the run from QUEUED -> RUNNING with a unique fencing token.
+    - If claim_token is provided (e.g. from recovery), matches the current claim token or claims anew.
     - If already claimed or processed, immediately exits (at-least-once idempotency).
+    - Validates source ownership, completed state, and snapshot integrity before executing.
     - Uses run.step_snapshot to ensure execution remains immutable.
     - Persists step audits and updates final run status.
+    - Catches unexpected worker crashes, logs full traceback server-side, and sanitizes API error_summary.
     """
+    new_claim_token = uuid.uuid4()
     now = timezone.now()
-    # Atomic claim: conditional update ensures only one worker runs this task
-    updated = WorkflowRun.objects.filter(id=run_id, state=WorkflowRun.State.QUEUED).update(
+
+    # Atomic claim:
+    # 1. Either state is QUEUED (claim_token can be null or match)
+    # 2. Or state is RUNNING and claim_token matches the expected claim_token passed in
+    claim_q = models.Q(id=run_id, state=WorkflowRun.State.QUEUED)
+    if claim_token:
+        claim_q |= models.Q(id=run_id, state=WorkflowRun.State.RUNNING, claim_token=claim_token)
+
+    updated = WorkflowRun.objects.filter(claim_q).update(
         state=WorkflowRun.State.RUNNING,
         started_at=now,
+        claim_token=new_claim_token,
     )
 
     if updated == 0:
         logger.warning(
-            "WorkflowRun %s was not in queued state or already claimed. Skipping.", run_id
+            "WorkflowRun %s was not eligible for worker claim (already running, completed, or fenced). Skipping.",
+            run_id,
         )
         return
 
+    worker_token = new_claim_token
+
     try:
-        run = WorkflowRun.objects.select_related("source_job", "owner").get(id=run_id)
+        run = WorkflowRun.objects.select_related("source_job", "workflow_definition", "owner").get(
+            id=run_id
+        )
     except WorkflowRun.DoesNotExist:
         logger.error("WorkflowRun %s not found in database.", run_id)
         return
 
+    # Security & Integrity Validations before execution
     source_job = run.source_job
+    workflow_def = run.workflow_definition
+    user = run.owner
+
+    # 1. Ownership consistency verification
+    if source_job.owner_id != user.id or (workflow_def and workflow_def.owner_id != user.id):
+        logger.warning(
+            "Security invariant violation: WorkflowRun %s has mismatched ownership. Aborting execution.",
+            run_id,
+        )
+        WorkflowRun.objects.filter(id=run_id, claim_token=worker_token).update(
+            state=WorkflowRun.State.FAILED,
+            output_data=[],
+            input_row_count=0,
+            output_row_count=0,
+            error_summary="Source data ownership validation failed.",
+            finished_at=timezone.now(),
+        )
+        return
+
+    # 2. Source job completion status verification
+    if source_job.state != ProcessingJob.State.COMPLETED:
+        logger.warning(
+            "WorkflowRun %s source job %s is in state '%s', not 'completed'. Aborting execution.",
+            run_id,
+            source_job.id,
+            source_job.state,
+        )
+        WorkflowRun.objects.filter(id=run_id, claim_token=worker_token).update(
+            state=WorkflowRun.State.FAILED,
+            output_data=[],
+            input_row_count=0,
+            output_row_count=0,
+            error_summary=f"Source processing job is not in completed state (current: '{source_job.state}').",
+            finished_at=timezone.now(),
+        )
+        return
+
+    # 3. Snapshot structure and integrity verification
+    step_snapshot = run.step_snapshot
+    if not isinstance(step_snapshot, list):
+        logger.warning("WorkflowRun %s has invalid step_snapshot format.", run_id)
+        WorkflowRun.objects.filter(id=run_id, claim_token=worker_token).update(
+            state=WorkflowRun.State.FAILED,
+            output_data=[],
+            input_row_count=0,
+            output_row_count=0,
+            error_summary="Invalid step snapshot format.",
+            finished_at=timezone.now(),
+        )
+        return
+
+    try:
+        validate_step_definitions(step_snapshot)
+    except WorkflowExecutionError as exc:
+        WorkflowRun.objects.filter(id=run_id, claim_token=worker_token).update(
+            state=WorkflowRun.State.FAILED,
+            output_data=[],
+            input_row_count=0,
+            output_row_count=0,
+            error_summary=exc.message,
+            finished_at=timezone.now(),
+        )
+        return
+
     input_data = source_job.output_data or []
     initial_input_row_count = len(input_data)
-    step_snapshot = run.step_snapshot or []
     initial_schema = source_job.column_names or (list(input_data[0].keys()) if input_data else [])
 
     try:
@@ -50,20 +139,20 @@ def execute_workflow_run_task(run_id: str):
         )
 
         with transaction.atomic():
-            run.state = WorkflowRun.State.COMPLETED
-            run.output_data = output_data
-            run.input_row_count = initial_input_row_count
-            run.output_row_count = len(output_data)
-            run.finished_at = timezone.now()
-            run.save(
-                update_fields=[
-                    "state",
-                    "output_data",
-                    "input_row_count",
-                    "output_row_count",
-                    "finished_at",
-                ]
+            # Check fencing token before persisting
+            rows_updated = WorkflowRun.objects.filter(id=run_id, claim_token=worker_token).update(
+                state=WorkflowRun.State.COMPLETED,
+                output_data=output_data,
+                input_row_count=initial_input_row_count,
+                output_row_count=len(output_data),
+                finished_at=timezone.now(),
             )
+            if rows_updated == 0:
+                logger.warning(
+                    "Fencing conflict: WorkflowRun %s was reclaimed by another worker. Dropping results.",
+                    run_id,
+                )
+                return
 
             step_runs = [
                 WorkflowStepRun(
@@ -81,22 +170,17 @@ def execute_workflow_run_task(run_id: str):
 
     except WorkflowExecutionError as exc:
         with transaction.atomic():
-            run.state = WorkflowRun.State.FAILED
-            run.output_data = []
-            run.input_row_count = initial_input_row_count
-            run.output_row_count = 0
-            run.error_summary = exc.message
-            run.finished_at = timezone.now()
-            run.save(
-                update_fields=[
-                    "state",
-                    "output_data",
-                    "input_row_count",
-                    "output_row_count",
-                    "error_summary",
-                    "finished_at",
-                ]
+            rows_updated = WorkflowRun.objects.filter(id=run_id, claim_token=worker_token).update(
+                state=WorkflowRun.State.FAILED,
+                output_data=[],
+                input_row_count=initial_input_row_count,
+                output_row_count=0,
+                error_summary=exc.message,
+                finished_at=timezone.now(),
             )
+            if rows_updated == 0:
+                logger.warning("Fencing conflict on failure: WorkflowRun %s was reclaimed.", run_id)
+                return
 
             step_objs = []
             for audit in exc.completed_step_audit:
@@ -125,22 +209,14 @@ def execute_workflow_run_task(run_id: str):
                 )
             WorkflowStepRun.objects.bulk_create(step_objs)
 
-    except Exception as exc:
+    except Exception:
         logger.exception("Unexpected exception executing WorkflowRun %s", run_id)
         with transaction.atomic():
-            run.state = WorkflowRun.State.FAILED
-            run.output_data = []
-            run.input_row_count = initial_input_row_count
-            run.output_row_count = 0
-            run.error_summary = f"Internal execution error: {str(exc)}"
-            run.finished_at = timezone.now()
-            run.save(
-                update_fields=[
-                    "state",
-                    "output_data",
-                    "input_row_count",
-                    "output_row_count",
-                    "error_summary",
-                    "finished_at",
-                ]
+            WorkflowRun.objects.filter(id=run_id, claim_token=worker_token).update(
+                state=WorkflowRun.State.FAILED,
+                output_data=[],
+                input_row_count=initial_input_row_count,
+                output_row_count=0,
+                error_summary=GENERIC_INTERNAL_ERROR_MESSAGE,
+                finished_at=timezone.now(),
             )

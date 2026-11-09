@@ -46,6 +46,7 @@ class WorkflowRunListSerializer(serializers.ModelSerializer):
             "workflow_definition",
             "source_job",
             "state",
+            "dispatch_status",
             "input_row_count",
             "output_row_count",
             "error_summary",
@@ -65,6 +66,7 @@ class WorkflowRunDetailSerializer(serializers.ModelSerializer):
             "workflow_definition",
             "source_job",
             "state",
+            "dispatch_status",
             "step_snapshot",
             "output_data",
             "input_row_count",
@@ -91,6 +93,7 @@ class WorkflowAsyncRunResponseSerializer(serializers.ModelSerializer):
             "workflow_definition",
             "source_job",
             "state",
+            "dispatch_status",
             "status_url",
             "created_at",
         ]

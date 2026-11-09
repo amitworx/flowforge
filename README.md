@@ -332,11 +332,24 @@ flowchart LR
 
 ### Architecture & Safety Invariants
 - **Opt-in Endpoint:** Asynchronous execution is requested via `POST /api/v1/workflows/{uuid}/runs/async/`. It returns HTTP `202 Accepted` with state `"queued"` and status polling URL.
-- **Transactional Enqueue:** Tasks are dispatched only after transaction commit using `django.db.transaction.on_commit`.
-- **Minimal Celery Payloads:** Celery messages carry strictly the database `run_id` (never file content or user payloads).
-- **Worker Claim Atomicity:** Workers conditionally claim runs (`UPDATE ... WHERE state='queued'`). If already claimed or processed, redundant delivery does not duplicate work.
+- **Transactional Enqueue & Broker Fault Tolerance:** Tasks are queued via `transaction.on_commit()`. If message broker publication fails (e.g. Redis temporarily unreachable), the run's `dispatch_status` is updated to `"failed"` with a safe notification, ensuring the run is not lost and remains eligible for background recovery.
+- **Minimal Celery Payloads:** Celery messages carry strictly the database `run_id` and fencing token (never file content or user payloads).
+- **Worker Claim Atomicity & Fencing:** Workers conditionally claim runs (`UPDATE ... WHERE state='queued'`). Workers generate and check a unique `claim_token` fencing identifier on state transitions. If a run was reclaimed after timing out, a zombie worker's results are cleanly dropped.
+- **Pre-execution Invariant Checks:** Workers independently verify that `run.owner == source_job.owner == workflow_definition.owner`, that `source_job.state == "completed"`, and that `step_snapshot` is a valid step definition list before executing pipeline operations. Mismatched or invalid inputs abort into a safe `FAILED` state.
+- **Internal Error Sanitization:** Unexpected worker crashes log the complete traceback server-side and present a safe, generic `error_summary` (`"Internal workflow execution error occurred."`) to API callers, ensuring raw database errors, socket exceptions, or system credentials are never exposed via the API.
+- **Recovery Management Command:** An explicit management command `python manage.py recover_workflow_runs` recovers stranded runs (`dispatch_status='failed'` or stale `running` runs beyond a configurable timeout) using fencing token rotation.
 - **Snapshot Execution:** Workers execute against the immutable `step_snapshot` persisted on `WorkflowRun`, ensuring subsequent mutations to `WorkflowDefinition` do not affect in-flight runs.
 - **Isolated Redis Network:** Redis in `docker-compose.yml` does **not** expose host ports; it is accessible solely across the internal Docker Compose bridge network.
+
+### Operational Recovery Command
+To reconcile stranded runs (e.g., after temporary Redis downtime or worker host termination):
+```bash
+# Docker Compose
+docker compose exec web python manage.py recover_workflow_runs --stale-minutes=15 --limit=50 --action=requeue
+
+# Local
+python manage.py recover_workflow_runs --stale-minutes=15 --limit=50 --action=requeue
+```
 
 ### cURL / PowerShell Examples
 
