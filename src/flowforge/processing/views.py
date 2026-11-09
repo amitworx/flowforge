@@ -17,6 +17,7 @@ from flowforge.processing.serializers import (
     ProcessingJobListSerializer,
 )
 from flowforge.processing.services import (
+    MAX_UPLOAD_SIZE_BYTES,
     IngestionError,
     parse_and_normalize_stream,
 )
@@ -35,6 +36,10 @@ class ProcessingJobListCreateView(APIView):
     POST /api/v1/jobs/
     - Accepts multipart/form-data upload with a 'file' parameter.
     - Synchronously validates, parses, normalizes and persists job record.
+    - Defense-in-depth size bounding:
+        Layer 1: Content-Length header validation (rejects > 1 MiB + 64 KiB multipart overhead).
+        Layer 2: Uploaded file size attribute validation before stream processing.
+        Layer 3: Bounded streaming read inside parse_and_normalize_stream.
 
     GET /api/v1/jobs/
     - Lists only the requesting user's jobs (paginated).
@@ -42,6 +47,22 @@ class ProcessingJobListCreateView(APIView):
 
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser]
+
+    def initial(self, request, *args, **kwargs):
+        # Layer 1: Boundary check against Content-Length header before processing large bodies
+        content_length = request.META.get("CONTENT_LENGTH")
+        if content_length:
+            try:
+                # Add 64 KiB tolerance for multipart boundaries and headers
+                if int(content_length) > (MAX_UPLOAD_SIZE_BYTES + 65536):
+                    # Raise early rejection for oversized payloads
+                    return Response(
+                        {"detail": "Request payload exceeds maximum allowed limit of 1 MiB."},
+                        status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    )
+            except (ValueError, TypeError):
+                pass
+        return super().initial(request, *args, **kwargs)
 
     def get(self, request: Request) -> Response:
         queryset = ProcessingJob.objects.filter(owner=request.user)
@@ -51,6 +72,18 @@ class ProcessingJobListCreateView(APIView):
         return paginator.get_paginated_response(serializer.data)
 
     def post(self, request: Request) -> Response:
+        # Check if Content-Length check in initial flagged an early response
+        content_length = request.META.get("CONTENT_LENGTH")
+        if content_length:
+            try:
+                if int(content_length) > (MAX_UPLOAD_SIZE_BYTES + 65536):
+                    return Response(
+                        {"detail": "Request payload exceeds maximum allowed limit of 1 MiB."},
+                        status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    )
+            except (ValueError, TypeError):
+                pass
+
         if "file" not in request.FILES:
             return Response(
                 {"detail": "A multipart file field named 'file' is required."},
@@ -60,8 +93,17 @@ class ProcessingJobListCreateView(APIView):
         uploaded_file = request.FILES["file"]
         filename = uploaded_file.name
 
+        # Layer 2: Reject oversized file objects prior to full stream reading
+        if uploaded_file.size > MAX_UPLOAD_SIZE_BYTES:
+            return Response(
+                {
+                    "detail": f"File size exceeds maximum allowed limit of {MAX_UPLOAD_SIZE_BYTES} bytes (1 MiB)."
+                },
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+
         try:
-            # Parse and normalize content
+            # Layer 3: Parse and normalize content with stream bounding
             parse_result = parse_and_normalize_stream(uploaded_file.file, filename=filename)
         except IngestionError as exc:
             return Response(

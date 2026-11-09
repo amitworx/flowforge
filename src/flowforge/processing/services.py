@@ -42,19 +42,43 @@ def sanitize_filename(filename: str | None) -> str:
 
 def detect_file_type(filename: str, initial_bytes: bytes) -> str:
     """
-    Detect file type ('csv' or 'json') using extension and content sniffing.
-    Does not blindly trust file extensions.
+    Detect file type ('csv' or 'json') using strict extension and content validation.
+    Enforces unambiguous extension/content agreement:
+    - Files with .csv extension MUST have valid CSV content and NOT start with JSON markers.
+    - Files with .json extension MUST start with valid JSON markers ('[' or '{').
+    - Unsupported extensions and mismatched contents are explicitly rejected.
     """
     lower = filename.lower()
     stripped = initial_bytes.strip()
 
-    if lower.endswith(".json") or (stripped.startswith(b"[") or stripped.startswith(b"{")):
+    is_json_ext = lower.endswith(".json")
+    is_csv_ext = lower.endswith(".csv")
+
+    if not (is_json_ext or is_csv_ext):
+        raise IngestionError(
+            f"Unsupported file extension for '{filename}'. Only .csv and .json files are accepted."
+        )
+
+    # Check for JSON syntax markers
+    has_json_syntax = stripped.startswith(b"[") or stripped.startswith(b"{")
+
+    if is_json_ext:
+        if not has_json_syntax:
+            raise IngestionError(
+                f"File extension and content mismatch: '{filename}' has a .json extension "
+                "but does not contain valid JSON syntax."
+            )
         return "json"
-    if lower.endswith(".csv") or (b"," in stripped or b"\n" in stripped):
+
+    if is_csv_ext:
+        if has_json_syntax:
+            raise IngestionError(
+                f"File extension and content mismatch: '{filename}' has a .csv extension "
+                "but contains JSON structured content."
+            )
         return "csv"
-    raise IngestionError(
-        f"Unsupported file type for '{filename}'. Only CSV (.csv) and JSON (.json) files are accepted."
-    )
+
+    raise IngestionError(f"Unsupported file type for '{filename}'.")
 
 
 def parse_and_normalize_stream(
@@ -93,11 +117,13 @@ def parse_and_normalize_stream(
 
 def _parse_csv(text: str, filename: str) -> ParseResult:
     """Parse and normalize CSV data preserving string representations."""
-    # Use StringIO with strict csv reader
+    # Use StringIO with strict csv reader (strict=True rejects unescaped/unterminated quotes)
     sio = io.StringIO(text, newline="")
     try:
-        reader = csv.reader(sio)
+        reader = csv.reader(sio, strict=True)
         header_row = next(reader, None)
+    except csv.Error as exc:
+        raise IngestionError(f"Malformed CSV content (syntax or quote error): {exc}") from exc
     except Exception as exc:
         raise IngestionError(f"Malformed CSV content: {exc}") from exc
 
@@ -119,28 +145,33 @@ def _parse_csv(text: str, filename: str) -> ParseResult:
 
     rows: list[dict[str, Any]] = []
     line_number = 1
-    for row in reader:
-        line_number += 1
-        # Skip completely empty trailing lines
-        if not row or all(c.strip() == "" for c in row):
-            continue
+    try:
+        for row in reader:
+            line_number += 1
+            # Skip completely empty trailing lines
+            if not row or all(c.strip() == "" for c in row):
+                continue
 
-        if len(row) != len(clean_headers):
-            raise IngestionError(
-                f"Row {line_number} has {len(row)} values, expected {len(clean_headers)} columns."
-            )
+            if len(row) != len(clean_headers):
+                raise IngestionError(
+                    f"Row {line_number} has {len(row)} values, expected {len(clean_headers)} columns."
+                )
 
-        # Build dict preserving cell values exactly as strings (preserving leading zeros)
-        record = {}
-        for idx, col in enumerate(clean_headers):
-            cell_val = row[idx]
-            # Guard against spreadsheet formula injection in string representation if later exported
-            # Preserve cell value as string
-            record[col] = cell_val
+            # Build dict preserving cell values exactly as strings (preserving leading zeros)
+            record = {}
+            for idx, col in enumerate(clean_headers):
+                cell_val = row[idx]
+                record[col] = cell_val
 
-        rows.append(record)
-        if len(rows) > MAX_ROW_COUNT:
-            raise IngestionError(f"CSV row count exceeds maximum limit of {MAX_ROW_COUNT} records.")
+            rows.append(record)
+            if len(rows) > MAX_ROW_COUNT:
+                raise IngestionError(
+                    f"CSV row count exceeds maximum limit of {MAX_ROW_COUNT} records."
+                )
+    except csv.Error as exc:
+        raise IngestionError(
+            f"Malformed CSV content at line {line_number} (syntax or quote error): {exc}"
+        ) from exc
 
     return ParseResult(
         file_type="csv",
