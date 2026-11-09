@@ -55,17 +55,38 @@ class ProcessingJobListCreateView(APIView):
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser]
 
-    def initial(self, request, *args, **kwargs):
-        # Layer 1: Boundary check against Content-Length header before processing large bodies
+    def initialize_request(self, request, *args, **kwargs):
+        # Scope BoundedFileUploadHandler specifically to the jobs ingestion endpoint,
+        # ensuring it precedes MemoryFileUploadHandler and TemporaryFileUploadHandler
+        # without altering global handlers for unrelated endpoints (e.g. Django admin).
+        existing_handlers = [
+            h for h in request.upload_handlers if not isinstance(h, BoundedFileUploadHandler)
+        ]
+        request.upload_handlers = [
+            BoundedFileUploadHandler(request, max_file_size=MAX_UPLOAD_SIZE_BYTES)
+        ] + existing_handlers
+        return super().initialize_request(request, *args, **kwargs)
+
+    def _check_early_content_length(self, request) -> None:
+        """
+        Layer 1 defense: Early boundary check against Content-Length header.
+        Rejects obviously oversized payloads before parsing commences.
+        Isolated into a helper method so tests can suppress or alter it to verify
+        streaming handler behavior under missing/unreliable headers without faking handlers.
+        """
         content_length = request.META.get("CONTENT_LENGTH")
         if content_length:
             try:
                 # Add 64 KiB tolerance for multipart boundaries and headers
                 if int(content_length) > (MAX_UPLOAD_SIZE_BYTES + 65536):
-                    # Raise early rejection for oversized payloads so execution terminates immediately
-                    raise PayloadTooLarge()
+                    raise PayloadTooLarge(
+                        detail=f"Request payload exceeds maximum allowed limit of {MAX_UPLOAD_SIZE_BYTES} bytes (1 MiB)."
+                    )
             except (ValueError, TypeError):
                 pass
+
+    def initial(self, request, *args, **kwargs):
+        self._check_early_content_length(request)
         return super().initial(request, *args, **kwargs)
 
     def get(self, request: Request) -> Response:
@@ -76,7 +97,10 @@ class ProcessingJobListCreateView(APIView):
         return paginator.get_paginated_response(serializer.data)
 
     def post(self, request: Request) -> Response:
-        # Check if any upload handler aborted due to size limits
+        # Trigger multipart stream parsing by accessing request.FILES
+        files = request.FILES
+
+        # Layer 2: Check if any upload handler aborted during streaming chunks
         for handler in getattr(request._request, "upload_handlers", []):
             if isinstance(handler, BoundedFileUploadHandler) and (
                 getattr(handler, "upload_aborted", False)
@@ -86,13 +110,13 @@ class ProcessingJobListCreateView(APIView):
                     detail=f"File size exceeds maximum allowed limit of {MAX_UPLOAD_SIZE_BYTES} bytes (1 MiB)."
                 )
 
-        if "file" not in request.FILES:
+        if "file" not in files:
             return Response(
                 {"detail": "A multipart file field named 'file' is required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        uploaded_file = request.FILES["file"]
+        uploaded_file = files["file"]
         filename = uploaded_file.name
 
         # Layer 2: Reject oversized file objects prior to full stream reading
