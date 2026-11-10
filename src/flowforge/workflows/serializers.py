@@ -161,3 +161,42 @@ class WorkflowAsyncRunResponseSerializer(serializers.ModelSerializer):
 
     def get_status_url(self, obj: WorkflowRun) -> str:
         return f"/api/v1/workflow-runs/{obj.id}/"
+
+
+class WorkflowPreviewRequestSerializer(serializers.Serializer):
+    source_job_id = serializers.UUIDField(required=True)
+    preview_limit = serializers.IntegerField(required=False, default=20, min_value=1, max_value=50)
+
+    def to_internal_value(self, data):
+        if not isinstance(data, dict):
+            raise serializers.ValidationError(
+                {"detail": "Invalid payload format. Expected a JSON object."}
+            )
+        allowed_fields = {"source_job_id", "preview_limit"}
+        disallowed = set(data.keys()) - allowed_fields
+        if disallowed:
+            raise serializers.ValidationError(
+                dict.fromkeys(
+                    sorted(disallowed),
+                    f"Unexpected field. Only {sorted(allowed_fields)} are allowed.",
+                )
+            )
+        return super().to_internal_value(data)
+
+
+class WorkflowPreviewStepAuditSerializer(serializers.Serializer):
+    step_index = serializers.IntegerField()
+    operation = serializers.CharField()
+    status = serializers.CharField()
+    input_row_count = serializers.IntegerField()
+    output_row_count = serializers.IntegerField()
+    error_summary = serializers.CharField(allow_null=True)
+
+
+class WorkflowPreviewResponseSerializer(serializers.Serializer):
+    output_columns = serializers.ListField(child=serializers.CharField())
+    input_row_count = serializers.IntegerField()
+    output_row_count = serializers.IntegerField()
+    preview_limit = serializers.IntegerField()
+    preview_rows = serializers.ListField(child=serializers.DictField())
+    step_audits = WorkflowPreviewStepAuditSerializer(many=True)
