@@ -2,6 +2,7 @@ import logging
 
 from django.db import transaction
 from django.http import HttpResponse
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.exceptions import NotFound
 from rest_framework.negotiation import BaseContentNegotiation
@@ -22,6 +23,7 @@ from flowforge.workflows.models import WorkflowDefinition, WorkflowRun
 from flowforge.workflows.serializers import (
     WorkflowAsyncRunResponseSerializer,
     WorkflowDefinitionSerializer,
+    WorkflowDefinitionUpdateSerializer,
     WorkflowRunCreateSerializer,
     WorkflowRunDetailSerializer,
     WorkflowRunListSerializer,
@@ -41,7 +43,23 @@ class WorkflowDefinitionListCreateView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request: Request) -> Response:
+        include_archived_param = (
+            request.query_params.get("include_archived", "false").lower().strip()
+        )
+        if include_archived_param in ("true", "1"):
+            include_archived = True
+        elif include_archived_param in ("false", "0"):
+            include_archived = False
+        else:
+            return Response(
+                {"detail": "Invalid 'include_archived' parameter. Must be 'true' or 'false'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         queryset = WorkflowDefinition.objects.filter(owner=request.user)
+        if not include_archived:
+            queryset = queryset.filter(is_archived=False)
+
         paginator = JobPagination()
         page = paginator.paginate_queryset(queryset, request, view=self)
         serializer = WorkflowDefinitionSerializer(page, many=True, context={"request": request})
@@ -59,6 +77,7 @@ class WorkflowDefinitionListCreateView(APIView):
 class WorkflowDefinitionDetailView(APIView):
     """
     GET /api/v1/workflows/{uuid}/
+    PATCH /api/v1/workflows/{uuid}/
     """
 
     permission_classes = [IsAuthenticated]
@@ -71,6 +90,99 @@ class WorkflowDefinitionDetailView(APIView):
 
     def get(self, request: Request, uuid: str) -> Response:
         workflow_def = self.get_object(uuid, request.user)
+        return Response(WorkflowDefinitionSerializer(workflow_def).data, status=status.HTTP_200_OK)
+
+    def patch(self, request: Request, uuid: str) -> Response:
+        workflow_def = self.get_object(uuid, request.user)
+
+        if workflow_def.is_archived:
+            return Response(
+                {"detail": "Cannot modify an archived workflow definition. Restore it first."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # Validate inputs outside the lock to avoid prolonged row contention
+        serializer = WorkflowDefinitionUpdateSerializer(
+            workflow_def,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            locked_wf = WorkflowDefinition.objects.select_for_update().get(
+                id=workflow_def.id, owner=request.user
+            )
+            if locked_wf.is_archived:
+                return Response(
+                    {"detail": "Cannot modify an archived workflow definition. Restore it first."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            # Apply validated fields inside atomic transaction
+            for attr, value in serializer.validated_data.items():
+                setattr(locked_wf, attr, value)
+            locked_wf.save(update_fields=list(serializer.validated_data.keys()) + ["updated_at"])
+
+        return Response(WorkflowDefinitionSerializer(locked_wf).data, status=status.HTTP_200_OK)
+
+
+class WorkflowArchiveView(APIView):
+    """
+    POST /api/v1/workflows/{uuid}/archive/
+    Safely and idempotently archives a WorkflowDefinition.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get_object(self, uuid: str, user) -> WorkflowDefinition:
+        try:
+            return WorkflowDefinition.objects.get(id=uuid, owner=user)
+        except (WorkflowDefinition.DoesNotExist, ValueError) as exc:
+            raise NotFound("Workflow definition not found.") from exc
+
+    def post(self, request: Request, uuid: str) -> Response:
+        self.get_object(uuid, request.user)
+
+        with transaction.atomic():
+            workflow_def = WorkflowDefinition.objects.select_for_update().get(
+                id=uuid, owner=request.user
+            )
+            if not workflow_def.is_archived:
+                workflow_def.is_archived = True
+                workflow_def.archived_at = timezone.now()
+                workflow_def.save(update_fields=["is_archived", "archived_at", "updated_at"])
+
+        return Response(WorkflowDefinitionSerializer(workflow_def).data, status=status.HTTP_200_OK)
+
+
+class WorkflowRestoreView(APIView):
+    """
+    POST /api/v1/workflows/{uuid}/restore/
+    Safely and idempotently restores an archived WorkflowDefinition.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get_object(self, uuid: str, user) -> WorkflowDefinition:
+        try:
+            return WorkflowDefinition.objects.get(id=uuid, owner=user)
+        except (WorkflowDefinition.DoesNotExist, ValueError) as exc:
+            raise NotFound("Workflow definition not found.") from exc
+
+    def post(self, request: Request, uuid: str) -> Response:
+        self.get_object(uuid, request.user)
+
+        with transaction.atomic():
+            workflow_def = WorkflowDefinition.objects.select_for_update().get(
+                id=uuid, owner=request.user
+            )
+            if workflow_def.is_archived:
+                workflow_def.is_archived = False
+                workflow_def.archived_at = None
+                workflow_def.save(update_fields=["is_archived", "archived_at", "updated_at"])
+
         return Response(WorkflowDefinitionSerializer(workflow_def).data, status=status.HTTP_200_OK)
 
 
@@ -90,6 +202,12 @@ class WorkflowExecuteRunView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        if workflow_def.is_archived:
+            return Response(
+                {"detail": "Cannot execute run against archived workflow definition."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
         serializer = WorkflowRunCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         source_job_id = serializer.validated_data["source_job_id"]
@@ -103,7 +221,16 @@ class WorkflowExecuteRunView(APIView):
             )
 
         try:
-            run = execute_workflow_run(workflow_def, source_job, request.user)
+            with transaction.atomic():
+                locked_wf = WorkflowDefinition.objects.select_for_update().get(
+                    id=workflow_def.id, owner=request.user
+                )
+                if locked_wf.is_archived:
+                    return Response(
+                        {"detail": "Cannot execute run against archived workflow definition."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                run = execute_workflow_run(locked_wf, source_job, request.user)
         except WorkflowServiceError as exc:
             return Response({"detail": exc.message}, status=exc.status_code)
 
@@ -131,6 +258,12 @@ class WorkflowExecuteAsyncRunView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        if workflow_def.is_archived:
+            return Response(
+                {"detail": "Cannot execute run against archived workflow definition."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
         serializer = WorkflowRunCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         source_job_id = serializer.validated_data["source_job_id"]
@@ -154,13 +287,21 @@ class WorkflowExecuteAsyncRunView(APIView):
         dispatch_error = None
 
         with transaction.atomic():
+            locked_wf = WorkflowDefinition.objects.select_for_update().get(
+                id=workflow_def.id, owner=request.user
+            )
+            if locked_wf.is_archived:
+                return Response(
+                    {"detail": "Cannot execute run against archived workflow definition."},
+                    status=status.HTTP_409_CONFLICT,
+                )
             run = WorkflowRun.objects.create(
                 owner=request.user,
-                workflow_definition=workflow_def,
+                workflow_definition=locked_wf,
                 source_job=source_job,
                 state=WorkflowRun.State.QUEUED,
                 dispatch_status=WorkflowRun.DispatchStatus.DISPATCHED,
-                step_snapshot=list(workflow_def.steps),
+                step_snapshot=list(locked_wf.steps),
                 input_row_count=len(source_job.output_data or []),
                 output_row_count=0,
             )
