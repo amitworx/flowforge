@@ -101,6 +101,7 @@ class WorkflowDefinitionDetailView(APIView):
                 status=status.HTTP_409_CONFLICT,
             )
 
+        # Validate inputs outside the lock to avoid prolonged row contention
         serializer = WorkflowDefinitionUpdateSerializer(
             workflow_def,
             data=request.data,
@@ -108,8 +109,23 @@ class WorkflowDefinitionDetailView(APIView):
             context={"request": request},
         )
         serializer.is_valid(raise_exception=True)
-        updated_wf = serializer.save()
-        return Response(WorkflowDefinitionSerializer(updated_wf).data, status=status.HTTP_200_OK)
+
+        with transaction.atomic():
+            locked_wf = WorkflowDefinition.objects.select_for_update().get(
+                id=workflow_def.id, owner=request.user
+            )
+            if locked_wf.is_archived:
+                return Response(
+                    {"detail": "Cannot modify an archived workflow definition. Restore it first."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            # Apply validated fields inside atomic transaction
+            for attr, value in serializer.validated_data.items():
+                setattr(locked_wf, attr, value)
+            locked_wf.save(update_fields=list(serializer.validated_data.keys()) + ["updated_at"])
+
+        return Response(WorkflowDefinitionSerializer(locked_wf).data, status=status.HTTP_200_OK)
 
 
 class WorkflowArchiveView(APIView):
@@ -127,16 +143,16 @@ class WorkflowArchiveView(APIView):
             raise NotFound("Workflow definition not found.") from exc
 
     def post(self, request: Request, uuid: str) -> Response:
-        workflow_def = self.get_object(uuid, request.user)
-        if not workflow_def.is_archived:
-            with transaction.atomic():
-                workflow_def = WorkflowDefinition.objects.select_for_update().get(
-                    id=uuid, owner=request.user
-                )
-                if not workflow_def.is_archived:
-                    workflow_def.is_archived = True
-                    workflow_def.archived_at = timezone.now()
-                    workflow_def.save(update_fields=["is_archived", "archived_at", "updated_at"])
+        self.get_object(uuid, request.user)
+
+        with transaction.atomic():
+            workflow_def = WorkflowDefinition.objects.select_for_update().get(
+                id=uuid, owner=request.user
+            )
+            if not workflow_def.is_archived:
+                workflow_def.is_archived = True
+                workflow_def.archived_at = timezone.now()
+                workflow_def.save(update_fields=["is_archived", "archived_at", "updated_at"])
 
         return Response(WorkflowDefinitionSerializer(workflow_def).data, status=status.HTTP_200_OK)
 
@@ -156,16 +172,16 @@ class WorkflowRestoreView(APIView):
             raise NotFound("Workflow definition not found.") from exc
 
     def post(self, request: Request, uuid: str) -> Response:
-        workflow_def = self.get_object(uuid, request.user)
-        if workflow_def.is_archived:
-            with transaction.atomic():
-                workflow_def = WorkflowDefinition.objects.select_for_update().get(
-                    id=uuid, owner=request.user
-                )
-                if workflow_def.is_archived:
-                    workflow_def.is_archived = False
-                    workflow_def.archived_at = None
-                    workflow_def.save(update_fields=["is_archived", "archived_at", "updated_at"])
+        self.get_object(uuid, request.user)
+
+        with transaction.atomic():
+            workflow_def = WorkflowDefinition.objects.select_for_update().get(
+                id=uuid, owner=request.user
+            )
+            if workflow_def.is_archived:
+                workflow_def.is_archived = False
+                workflow_def.archived_at = None
+                workflow_def.save(update_fields=["is_archived", "archived_at", "updated_at"])
 
         return Response(WorkflowDefinitionSerializer(workflow_def).data, status=status.HTTP_200_OK)
 

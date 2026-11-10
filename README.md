@@ -521,6 +521,10 @@ curl -s -X PATCH http://127.0.0.1:8001/api/v1/workflows/<uuid>/ \
 - **Restore Endpoint:** `POST /api/v1/workflows/{uuid}/restore/`
 - **Idempotency:** Both operations are idempotent. Calling archive on an already archived workflow returns `200 OK` preserving the original `archived_at` timestamp. Calling restore on an unarchived workflow returns `200 OK` without error.
 - **Run Rejection (`409 Conflict`):** Archived workflow definitions strictly reject new synchronous (`POST /runs/`) and asynchronous (`POST /runs/async/`) run requests with `409 Conflict`, without creating a `WorkflowRun` database record or publishing to Celery.
+- **Concurrency & Atomic Locking:**
+  - `PATCH`, `archive`, `restore`, and run creation serialize concurrently on the target `WorkflowDefinition` row using `select_for_update()` inside bounded `transaction.atomic()` blocks.
+  - In `PATCH`, inputs are validated outside the lock to minimize contention; upon entering the lock, the row's archived state is rechecked before applying changes, guaranteeing that a concurrent archive commits cleanly and prevents edits to archived workflows (`409 Conflict`).
+  - Both `archive` and `restore` lock the row unconditionally, reading fresh database state to ensure linearizable, truthful state transitions.
 - **In-Flight Executions:** In-flight queued or running async executions are never aborted by archiving; they proceed to terminal state using their stored snapshot.
 - **Hard DELETE Disabled (`405 Method Not Allowed`):** Hard `DELETE /api/v1/workflows/{uuid}/` is rejected with `405 Method Not Allowed` to prevent cascading deletion of historic runs and exports.
 
