@@ -157,6 +157,33 @@ def export_workflow_run_to_csv(
     return buffer.getvalue()
 
 
+def serialize_to_bounded_json(
+    data: Any,
+    max_bytes: int = DEFAULT_MAX_EXPORT_SIZE_BYTES,
+    indent: int | None = 2,
+) -> bytes:
+    """
+    Deterministically encode arbitrary Python data (dict, list, etc.) to a UTF-8 encoded JSON byte string
+    while enforcing an upper byte limit incrementally during serialization to bound memory.
+    Preserves scalar types, strings with leading zeros, Unicode, numbers, booleans, and nulls without modification.
+    Raises ExportPayloadTooLargeError as soon as accumulated UTF-8 bytes exceed max_bytes.
+    """
+    encoder = json.JSONEncoder(ensure_ascii=False, indent=indent)
+    accumulated_chunks: list[bytes] = []
+    current_bytes = 0
+
+    for chunk in encoder.iterencode(data):
+        encoded_chunk = chunk.encode("utf-8")
+        current_bytes += len(encoded_chunk)
+        if current_bytes > max_bytes:
+            raise ExportPayloadTooLargeError(
+                f"JSON payload size exceeds maximum limit of {max_bytes} bytes."
+            )
+        accumulated_chunks.append(encoded_chunk)
+
+    return b"".join(accumulated_chunks)
+
+
 def export_workflow_run_to_json(
     output_data: list[dict[str, Any]],
     max_bytes: int = DEFAULT_MAX_EXPORT_SIZE_BYTES,
@@ -167,17 +194,4 @@ def export_workflow_run_to_json(
     Enforces max_bytes UTF-8 limit incrementally during serialization to bound memory.
     Raises ExportPayloadTooLargeError as soon as accumulated UTF-8 bytes exceed max_bytes.
     """
-    encoder = json.JSONEncoder(ensure_ascii=False, indent=2)
-    accumulated_chunks: list[bytes] = []
-    current_bytes = 0
-
-    for chunk in encoder.iterencode(output_data):
-        encoded_chunk = chunk.encode("utf-8")
-        current_bytes += len(encoded_chunk)
-        if current_bytes > max_bytes:
-            raise ExportPayloadTooLargeError(
-                f"JSON export size exceeds maximum limit of {max_bytes} bytes."
-            )
-        accumulated_chunks.append(encoded_chunk)
-
-    return b"".join(accumulated_chunks)
+    return serialize_to_bounded_json(output_data, max_bytes=max_bytes, indent=2)

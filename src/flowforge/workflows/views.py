@@ -1,4 +1,3 @@
-import json
 import logging
 
 from django.db import transaction
@@ -23,6 +22,7 @@ from flowforge.workflows.export import (
     ExportPayloadTooLargeError,
     export_workflow_run_to_csv,
     export_workflow_run_to_json,
+    serialize_to_bounded_json,
 )
 from flowforge.workflows.models import WorkflowDefinition, WorkflowRun
 from flowforge.workflows.serializers import (
@@ -547,18 +547,30 @@ class WorkflowPreviewView(APIView):
             "step_audits": step_audits,
         }
 
+        # Validate content negotiation to reject unsupported Accept headers (e.g. text/html)
+        self.perform_content_negotiation(request)
+
         # Validate against response serializer
         resp_serializer = WorkflowPreviewResponseSerializer(data=response_payload)
         resp_serializer.is_valid(raise_exception=True)
 
-        # Check payload size limit (reuse export limit 10 MiB)
-        serialized_bytes = json.dumps(resp_serializer.data).encode("utf-8")
-        if len(serialized_bytes) > DEFAULT_MAX_EXPORT_SIZE_BYTES:
+        # Check payload size limit incrementally and obtain verified UTF-8 JSON bytes
+        try:
+            serialized_bytes = serialize_to_bounded_json(
+                resp_serializer.data,
+                max_bytes=DEFAULT_MAX_EXPORT_SIZE_BYTES,
+                indent=2,
+            )
+        except ExportPayloadTooLargeError:
             return Response(
                 {
-                    "detail": f"Preview response size of {len(serialized_bytes)} bytes exceeds maximum allowed size of {DEFAULT_MAX_EXPORT_SIZE_BYTES} bytes."
+                    "detail": f"Preview response size exceeds maximum allowed size of {DEFAULT_MAX_EXPORT_SIZE_BYTES} bytes."
                 },
                 status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             )
 
-        return Response(resp_serializer.data, status=status.HTTP_200_OK)
+        return HttpResponse(
+            serialized_bytes,
+            status=status.HTTP_200_OK,
+            content_type="application/json; charset=utf-8",
+        )

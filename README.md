@@ -588,8 +588,10 @@ FlowForge provides a pre-run, read-only preview API allowing users to inspect tr
   - If a step fails during pipeline execution (e.g. column not found in schema), the API returns a sanitized `400 Bad Request` containing the `step_index`, sanitized `detail`, `completed_step_audits`, and `failed_step_audit`. No internal Python exceptions or tracebacks are leaked.
 - **Archived Workflow Rejection (409 Conflict):**
   - Archived workflows cannot be previewed (`409 Conflict: Cannot preview an archived workflow definition. Restore it first.`).
-- **Response Size Bounding (413 Payload Too Large):**
-  - Preview responses enforce the 10 MiB payload cap (`DEFAULT_MAX_EXPORT_SIZE_BYTES`). Responses exceeding this limit return `413 Request Entity Too Large`.
+- **Response Size Bounding & Incremental Encoding (413 Payload Too Large):**
+  - Preview responses enforce the 10 MiB payload cap (`DEFAULT_MAX_EXPORT_SIZE_BYTES`).
+  - Serializes using bounded incremental UTF-8 JSON encoding (`json.JSONEncoder.iterencode`) to bound memory allocation before emitting responses.
+  - The byte check applies directly to the exact UTF-8 HTTP response bytes (`application/json; charset=utf-8`). Responses exceeding this limit return `413 Request Entity Too Large` (`{"detail": "Preview response size exceeds maximum allowed size of 10485760 bytes."}`).
 - **Concurrency & Snapshot Isolation:**
   - Previews acquire a brief PostgreSQL row lock (`select_for_update()`) inside a short atomic transaction to snapshot the workflow definition steps and verify active status.
   - The transaction commits and releases the row lock **before** executing in-memory pipeline transformations, preventing long-running row contention while preserving linearizability against concurrent `PATCH` and `archive` operations.
