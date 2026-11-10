@@ -8,7 +8,7 @@ from flowforge.processing.models import ProcessingJob
 
 class WorkflowDefinition(models.Model):
     """
-    Immutable representation of an ordered series of validated step definitions.
+    Representation of an ordered series of validated step definitions.
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -19,6 +19,16 @@ class WorkflowDefinition(models.Model):
     )
     name = models.CharField(max_length=128)
     steps = models.JSONField(help_text="Ordered list of validated transformation steps.")
+    is_archived = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="Whether this workflow definition is archived.",
+    )
+    archived_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Timestamp when this workflow was archived.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

@@ -491,6 +491,45 @@ FlowForge provides authenticated endpoints for downloading the completed results
    - Byte size is verified incrementally during serialization (incremental row tracking in CSV; `json.JSONEncoder.iterencode` chunk accumulation in JSON) against actual multi-byte UTF-8 payload lengths, bounding memory before full serialization completes.
    - If an export exceeds the configured byte threshold, serialization terminates immediately without emitting partial files and returns `413 Request Entity Too Large` (`{"detail": "Export payload exceeds the maximum allowed size of 10485760 bytes."}`).
 
+---
+
+## Workflow Definition Edit & Archive Lifecycle (M0-006)
+
+FlowForge supports safe, owner-only partial updates and soft archiving/restoration of `WorkflowDefinition` resources without destructive cascade deletion of historical run data.
+
+### 1. Partial Update (`PATCH /api/v1/workflows/{uuid}/`)
+- **Method:** `PATCH`
+- **Authentication:** Required (owner only). Foreign or non-existent IDs return `404 Not Found`.
+- **Modifiable Fields:** `name` (1-128 chars) and/or `steps` (1-10 validated operations).
+- **Validation:** Rejects invalid names, invalid step definitions, read-only/immutable fields (`id`, `created_at`, `owner`, `is_archived`, `archived_at`), and unknown fields with `400 Bad Request`.
+- **Archived Guard:** Attempting to PATCH an archived workflow returns `409 Conflict`.
+- **Historical Run Preservation:** Modifying `steps` on a workflow definition **never** mutates historical `WorkflowRun.step_snapshot`, `output_data`, `output_columns`, step audit records, or export downloads. Queued asynchronous executions continue using their pre-edit captured snapshot.
+
+```bash
+# Example: Update workflow name and steps
+curl -s -X PATCH http://127.0.0.1:8001/api/v1/workflows/<uuid>/ \
+  -u devuser:devpass123 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Updated Customer Filter",
+    "steps": [{"op": "select_columns", "columns": ["id", "email"]}]
+  }' | jq .
+```
+
+### 2. Archive & Restore Operations
+- **Archive Endpoint:** `POST /api/v1/workflows/{uuid}/archive/`
+- **Restore Endpoint:** `POST /api/v1/workflows/{uuid}/restore/`
+- **Idempotency:** Both operations are idempotent. Calling archive on an already archived workflow returns `200 OK` preserving the original `archived_at` timestamp. Calling restore on an unarchived workflow returns `200 OK` without error.
+- **Run Rejection (`409 Conflict`):** Archived workflow definitions strictly reject new synchronous (`POST /runs/`) and asynchronous (`POST /runs/async/`) run requests with `409 Conflict`, without creating a `WorkflowRun` database record or publishing to Celery.
+- **In-Flight Executions:** In-flight queued or running async executions are never aborted by archiving; they proceed to terminal state using their stored snapshot.
+- **Hard DELETE Disabled (`405 Method Not Allowed`):** Hard `DELETE /api/v1/workflows/{uuid}/` is rejected with `405 Method Not Allowed` to prevent cascading deletion of historic runs and exports.
+
+### 3. List Filtering
+- `GET /api/v1/workflows/`: By default returns only active (`is_archived=false`) workflow definitions.
+- `GET /api/v1/workflows/?include_archived=true`: Opt-in parameter to include both active and archived definitions in the paginated results. Non-boolean values return `400 Bad Request`.
+
+---
+
 ## Troubleshooting
 
 - **Port Conflict (`listen tcp 127.0.0.1:8000: bind`):**
