@@ -64,29 +64,29 @@ def test_parallel_recovery_commands_cannot_both_reserve_same_run(sample_job, sam
         dispatches.append(args)
         time.sleep(0.05)
 
-    def run_cmd():
-        # New DB connection per thread
-        connection.close()
-        with (
-            patch(
-                "flowforge.workflows.tasks.execute_workflow_run_task.delay",
-                side_effect=fake_delay,
-            ),
-            patch(
-                "flowforge.workflows.management.commands.recover_workflow_runs.execute_workflow_run_task.delay",
-                side_effect=fake_delay,
-            ),
-        ):
+    with (
+        patch(
+            "flowforge.workflows.tasks.execute_workflow_run_task.delay",
+            side_effect=fake_delay,
+        ),
+        patch(
+            "flowforge.workflows.management.commands.recover_workflow_runs.execute_workflow_run_task.delay",
+            side_effect=fake_delay,
+        ),
+    ):
+
+        def run_cmd():
+            connection.close()
             call_command("recover_workflow_runs", max_attempts=5, ignore_backoff=True)
-        connection.close()
+            connection.close()
 
-    t1 = threading.Thread(target=run_cmd)
-    t2 = threading.Thread(target=run_cmd)
+        t1 = threading.Thread(target=run_cmd)
+        t2 = threading.Thread(target=run_cmd)
 
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
 
     # Only one recovery command should have reserved and dispatched the run in this round
     assert len(dispatches) == 1
