@@ -36,6 +36,7 @@ FlowForge is an open-source, self-hostable Python document-processing and workfl
 - Create workflow definition: `POST /api/v1/workflows/` (Authenticated)
 - List workflow definitions: `GET /api/v1/workflows/` (Authenticated)
 - Retrieve workflow definition: `GET /api/v1/workflows/{uuid}/` (Authenticated)
+- Preview workflow execution (read-only): `POST /api/v1/workflows/{uuid}/preview/` (Authenticated)
 - Execute workflow run: `POST /api/v1/workflows/{uuid}/runs/` (Authenticated, Synchronous)
 - Enqueue async workflow run: `POST /api/v1/workflows/{uuid}/runs/async/` (Authenticated, Asynchronous)
 - List workflow runs: `GET /api/v1/workflow-runs/` (Authenticated)
@@ -531,6 +532,69 @@ curl -s -X PATCH http://127.0.0.1:8001/api/v1/workflows/<uuid>/ \
 ### 3. List Filtering
 - `GET /api/v1/workflows/`: By default returns only active (`is_archived=false`) workflow definitions.
 - `GET /api/v1/workflows/?include_archived=true`: Opt-in parameter to include both active and archived definitions in the paginated results. Non-boolean values return `400 Bad Request`.
+
+---
+
+## Safe Workflow Preview (M0-007)
+
+FlowForge provides a pre-run, read-only preview API allowing users to inspect transformed sample rows and validate definitions against completed ingestion jobs before committing a persistent run.
+
+### 1. Preview Endpoint (`POST /api/v1/workflows/{uuid}/preview/`)
+- **Method:** `POST`
+- **Authentication:** Required (owner only). Foreign vs. missing workflows or source jobs return indistinguishable safe `404 Not Found`.
+- **Request Body:**
+  ```json
+  {
+    "source_job_id": "<uuid>",
+    "preview_limit": 20
+  }
+  ```
+  - `source_job_id` (required, UUID): ID of a `completed` processing job owned by the user. Non-completed jobs return `400 Bad Request`.
+  - `preview_limit` (optional, integer): Number of preview rows to return in `preview_rows` (default 20, min 1, max 50). Values outside this range return `400 Bad Request`.
+  - Extra/unrecognized fields return `400 Bad Request`.
+
+### 2. No-Side-Effect Contract & Execution Model
+- **Zero Database Side Effects:**
+  - **Never** creates `WorkflowRun` or `WorkflowStepRun` records.
+  - **Never** modifies `ProcessingJob` or `WorkflowDefinition`.
+  - **Never** dispatches tasks to Celery or the message broker.
+- **Full-Dataset Evaluation vs. Preview Slicing:**
+  - The shared deterministic engine (`execute_workflow_pipeline_with_schema`) executes across **all rows** of the input dataset (up to the 1,000-row limit) before slicing `preview_rows` to `preview_limit`.
+  - `input_row_count`, `output_row_count`, and `step_audits` reflect execution across the entire dataset, guaranteeing consistency with actual run execution counts.
+- **Response Format (200 OK):**
+  ```json
+  {
+    "output_columns": ["id", "full_name", "status"],
+    "input_row_count": 3,
+    "output_row_count": 3,
+    "preview_limit": 20,
+    "preview_rows": [
+      {"id": "001", "full_name": "Alice", "status": "active"},
+      {"id": "002", "full_name": "Bob", "status": "inactive"}
+    ],
+    "step_audits": [
+      {
+        "step_index": 0,
+        "operation": "select_columns",
+        "status": "completed",
+        "input_row_count": 3,
+        "output_row_count": 3,
+        "error_summary": null
+      }
+    ]
+  }
+  ```
+- **Error Handling (400 Bad Request):**
+  - If a step fails during pipeline execution (e.g. column not found in schema), the API returns a sanitized `400 Bad Request` containing the `step_index`, sanitized `detail`, `completed_step_audits`, and `failed_step_audit`. No internal Python exceptions or tracebacks are leaked.
+- **Archived Workflow Rejection (409 Conflict):**
+  - Archived workflows cannot be previewed (`409 Conflict: Cannot preview an archived workflow definition. Restore it first.`).
+- **Response Size Bounding & Incremental Encoding (413 Payload Too Large):**
+  - Preview responses enforce the 10 MiB payload cap (`DEFAULT_MAX_EXPORT_SIZE_BYTES`).
+  - Serializes using bounded incremental UTF-8 JSON encoding (`json.JSONEncoder.iterencode`) to bound memory allocation before emitting responses.
+  - The byte check applies directly to the exact UTF-8 HTTP response bytes (`application/json; charset=utf-8`). Responses exceeding this limit return `413 Request Entity Too Large` (`{"detail": "Preview response size exceeds maximum allowed size of 10485760 bytes."}`).
+- **Concurrency & Snapshot Isolation:**
+  - Previews acquire a brief PostgreSQL row lock (`select_for_update()`) inside a short atomic transaction to snapshot the workflow definition steps and verify active status.
+  - The transaction commits and releases the row lock **before** executing in-memory pipeline transformations, preventing long-running row contention while preserving linearizability against concurrent `PATCH` and `archive` operations.
 
 ---
 

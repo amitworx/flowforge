@@ -13,17 +13,24 @@ from rest_framework.views import APIView
 
 from flowforge.processing.models import ProcessingJob
 from flowforge.processing.views import JobPagination
+from flowforge.workflows.engine import (
+    WorkflowExecutionError,
+    execute_workflow_pipeline_with_schema,
+)
 from flowforge.workflows.export import (
     DEFAULT_MAX_EXPORT_SIZE_BYTES,
     ExportPayloadTooLargeError,
     export_workflow_run_to_csv,
     export_workflow_run_to_json,
+    serialize_to_bounded_json,
 )
 from flowforge.workflows.models import WorkflowDefinition, WorkflowRun
 from flowforge.workflows.serializers import (
     WorkflowAsyncRunResponseSerializer,
     WorkflowDefinitionSerializer,
     WorkflowDefinitionUpdateSerializer,
+    WorkflowPreviewRequestSerializer,
+    WorkflowPreviewResponseSerializer,
     WorkflowRunCreateSerializer,
     WorkflowRunDetailSerializer,
     WorkflowRunListSerializer,
@@ -444,3 +451,126 @@ class WorkflowRunDownloadView(APIView):
                 {"detail": exc.message},
                 status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             )
+
+
+class WorkflowPreviewView(APIView):
+    """
+    POST /api/v1/workflows/{uuid}/preview/
+    Read-only pre-run workflow preview endpoint.
+    Validates a workflow pipeline against a completed processing job's dataset
+    without creating persisted runs or mutating any state.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request: Request, uuid: str) -> Response:
+        try:
+            workflow_def = WorkflowDefinition.objects.get(id=uuid, owner=request.user)
+        except (WorkflowDefinition.DoesNotExist, ValueError):
+            return Response(
+                {"detail": "Workflow definition not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if workflow_def.is_archived:
+            return Response(
+                {"detail": "Cannot preview an archived workflow definition. Restore it first."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        serializer = WorkflowPreviewRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        source_job_id = serializer.validated_data["source_job_id"]
+        preview_limit = serializer.validated_data.get("preview_limit", 20)
+
+        try:
+            source_job = ProcessingJob.objects.get(id=source_job_id, owner=request.user)
+        except (ProcessingJob.DoesNotExist, ValueError):
+            return Response(
+                {"detail": "Source processing job not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if source_job.state != ProcessingJob.State.COMPLETED:
+            return Response(
+                {
+                    "detail": f"Cannot preview workflow against source job in '{source_job.state}' state. Must be 'completed'."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Snapshot workflow definition and source job state under a short atomic transaction + row lock
+        with transaction.atomic():
+            locked_wf = WorkflowDefinition.objects.select_for_update().get(
+                id=workflow_def.id, owner=request.user
+            )
+            if locked_wf.is_archived:
+                return Response(
+                    {"detail": "Cannot preview an archived workflow definition. Restore it first."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            steps_snapshot = list(locked_wf.steps)
+            locked_job = ProcessingJob.objects.get(id=source_job.id, owner=request.user)
+            input_data_copy = [dict(row) for row in (locked_job.output_data or [])]
+            initial_schema = (
+                list(locked_job.column_names)
+                if locked_job.column_names
+                else (list(input_data_copy[0].keys()) if input_data_copy else [])
+            )
+
+        # Execute pure deterministic pipeline in memory outside of database transaction
+        input_row_count = len(input_data_copy)
+        try:
+            output_data, step_audits, output_columns = execute_workflow_pipeline_with_schema(
+                input_data_copy, steps_snapshot, schema=initial_schema
+            )
+        except WorkflowExecutionError as exc:
+            return Response(
+                {
+                    "detail": exc.message,
+                    "step_index": exc.step_index,
+                    "completed_step_audits": exc.completed_step_audit,
+                    "failed_step_audit": exc.failed_step_audit,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        output_row_count = len(output_data)
+        preview_rows = output_data[:preview_limit]
+
+        response_payload = {
+            "output_columns": output_columns,
+            "input_row_count": input_row_count,
+            "output_row_count": output_row_count,
+            "preview_limit": preview_limit,
+            "preview_rows": preview_rows,
+            "step_audits": step_audits,
+        }
+
+        # Validate content negotiation to reject unsupported Accept headers (e.g. text/html)
+        self.perform_content_negotiation(request)
+
+        # Validate against response serializer
+        resp_serializer = WorkflowPreviewResponseSerializer(data=response_payload)
+        resp_serializer.is_valid(raise_exception=True)
+
+        # Check payload size limit incrementally and obtain verified UTF-8 JSON bytes
+        try:
+            serialized_bytes = serialize_to_bounded_json(
+                resp_serializer.data,
+                max_bytes=DEFAULT_MAX_EXPORT_SIZE_BYTES,
+                indent=2,
+            )
+        except ExportPayloadTooLargeError:
+            return Response(
+                {
+                    "detail": f"Preview response size exceeds maximum allowed size of {DEFAULT_MAX_EXPORT_SIZE_BYTES} bytes."
+                },
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+
+        return HttpResponse(
+            serialized_bytes,
+            status=status.HTTP_200_OK,
+            content_type="application/json; charset=utf-8",
+        )

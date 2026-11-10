@@ -687,3 +687,366 @@ def test_concurrent_patch_then_async_run_uses_post_patch_snapshot(
     run = WorkflowRun.objects.get(id=results["async_run_data"]["id"])
     assert run.step_snapshot == [{"op": "select_columns", "columns": ["id"]}]
     assert run.state == WorkflowRun.State.QUEUED
+
+
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_patch_then_preview_uses_post_patch_snapshot(
+    user_a, sample_workflow, sample_job
+):
+    """
+    Ordering Proof: PATCH -> PREVIEW
+    Test scenario: PATCH acquires the row lock to update definition steps.
+    PREVIEW arrives and blocks on the PostgreSQL row lock.
+    Once PATCH commits, PREVIEW unblocks, snapshots the updated definition,
+    and returns preview results reflecting the new steps.
+    """
+    patch_in_lock = threading.Event()
+    preview_blocked = threading.Event()
+
+    orig_save = WorkflowDefinition.save
+
+    def intercept_patch_save(self, *args, **kwargs):
+        if getattr(self, "id", None) == sample_workflow.id:
+            patch_in_lock.set()
+            if not preview_blocked.wait(timeout=5):
+                raise TimeoutError("preview_blocked event was not set in time")
+        return orig_save(self, *args, **kwargs)
+
+    results = {}
+    thread_errors = []
+
+    def do_patch():
+        try:
+            connection.close()
+            client = APIClient()
+            client.force_authenticate(user=user_a)
+            with patch.object(
+                WorkflowDefinition, "save", autospec=True, side_effect=intercept_patch_save
+            ):
+                res = client.patch(
+                    f"/api/v1/workflows/{sample_workflow.id}/",
+                    data={"steps": [{"op": "select_columns", "columns": ["name"]}]},
+                    format="json",
+                )
+                results["patch_status"] = res.status_code
+        except Exception as exc:
+            thread_errors.append(exc)
+        finally:
+            connection.close()
+
+    def do_preview():
+        try:
+            connection.close()
+            if not patch_in_lock.wait(timeout=5):
+                raise TimeoutError("patch_in_lock event was not set in time")
+            client = APIClient()
+            client.force_authenticate(user=user_a)
+            res = client.post(
+                f"/api/v1/workflows/{sample_workflow.id}/preview/",
+                data={"source_job_id": str(sample_job.id)},
+                format="json",
+            )
+            results["preview_status"] = res.status_code
+            results["preview_data"] = res.json()
+        except Exception as exc:
+            thread_errors.append(exc)
+        finally:
+            connection.close()
+
+    t_patch = threading.Thread(target=do_patch)
+    t_preview = threading.Thread(target=do_preview)
+
+    t_patch.start()
+    t_preview.start()
+
+    assert wait_for_blocked_db_lock(timeout=5.0), "PREVIEW did not block on PostgreSQL lock"
+    preview_blocked.set()
+
+    t_patch.join(timeout=10)
+    t_preview.join(timeout=10)
+
+    assert not t_patch.is_alive()
+    assert not t_preview.is_alive()
+    assert not thread_errors, f"Exceptions in background threads: {thread_errors}"
+
+    assert results["patch_status"] == status.HTTP_200_OK
+    assert results["preview_status"] == status.HTTP_200_OK
+    assert results["preview_data"]["output_columns"] == ["name"]
+    assert results["preview_data"]["preview_rows"][0] == {"name": "Alice"}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_preview_then_patch_uses_pre_patch_snapshot(user_a, sample_workflow, sample_job):
+    """
+    Ordering Proof: PREVIEW -> PATCH
+    Test scenario: PREVIEW acquires the row lock to snapshot the active definition.
+    PATCH arrives and blocks on the PostgreSQL row lock.
+    PREVIEW finishes taking its snapshot and completes.
+    PATCH unblocks and commits the edit.
+    The preview output reflects the pre-patch definition.
+    """
+    preview_in_lock = threading.Event()
+    patch_blocked = threading.Event()
+
+    orig_select = WorkflowDefinition.objects.select_for_update
+
+    def intercept_select(*args, **kwargs):
+        qs = orig_select(*args, **kwargs)
+        orig_get = qs.get
+
+        def intercept_get(*g_args, **g_kwargs):
+            obj = orig_get(*g_args, **g_kwargs)
+            if getattr(obj, "id", None) == sample_workflow.id:
+                preview_in_lock.set()
+                if not patch_blocked.wait(timeout=5):
+                    raise TimeoutError("patch_blocked event was not set in time")
+            return obj
+
+        qs.get = intercept_get
+        return qs
+
+    results = {}
+    thread_errors = []
+
+    def do_preview():
+        try:
+            connection.close()
+            client = APIClient()
+            client.force_authenticate(user=user_a)
+            with patch.object(
+                WorkflowDefinition.objects,
+                "select_for_update",
+                side_effect=intercept_select,
+            ):
+                res = client.post(
+                    f"/api/v1/workflows/{sample_workflow.id}/preview/",
+                    data={"source_job_id": str(sample_job.id)},
+                    format="json",
+                )
+                results["preview_status"] = res.status_code
+                results["preview_data"] = res.json()
+        except Exception as exc:
+            thread_errors.append(exc)
+        finally:
+            connection.close()
+
+    def do_patch():
+        try:
+            connection.close()
+            if not preview_in_lock.wait(timeout=5):
+                raise TimeoutError("preview_in_lock event was not set in time")
+            client = APIClient()
+            client.force_authenticate(user=user_a)
+            res = client.patch(
+                f"/api/v1/workflows/{sample_workflow.id}/",
+                data={"steps": [{"op": "select_columns", "columns": ["name"]}]},
+                format="json",
+            )
+            results["patch_status"] = res.status_code
+        except Exception as exc:
+            thread_errors.append(exc)
+        finally:
+            connection.close()
+
+    t_preview = threading.Thread(target=do_preview)
+    t_patch = threading.Thread(target=do_patch)
+
+    t_preview.start()
+    t_patch.start()
+
+    assert wait_for_blocked_db_lock(timeout=5.0), "PATCH did not block on PostgreSQL lock"
+    patch_blocked.set()
+
+    t_preview.join(timeout=10)
+    t_patch.join(timeout=10)
+
+    assert not t_preview.is_alive()
+    assert not t_patch.is_alive()
+    assert not thread_errors, f"Exceptions in background threads: {thread_errors}"
+
+    assert results["preview_status"] == status.HTTP_200_OK
+    assert results["patch_status"] == status.HTTP_200_OK
+
+    # Pre-patch had columns ['id', 'name']
+    assert results["preview_data"]["output_columns"] == ["id", "name"]
+    assert results["preview_data"]["preview_rows"][0] == {"id": "001", "name": "Alice"}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_archive_wins_over_preview_forces_409(user_a, sample_workflow, sample_job):
+    """
+    Ordering Proof: ARCHIVE -> PREVIEW
+    Test scenario: ARCHIVE acquires the row lock. PREVIEW arrives and blocks on the lock.
+    ARCHIVE commits is_archived=True.
+    PREVIEW unblocks inside its lock, detects the archived state, and returns 409 Conflict.
+    """
+    archive_in_lock = threading.Event()
+    preview_blocked = threading.Event()
+
+    orig_save = WorkflowDefinition.save
+
+    def intercept_archive_save(self, *args, **kwargs):
+        if getattr(self, "id", None) == sample_workflow.id and self.is_archived:
+            archive_in_lock.set()
+            if not preview_blocked.wait(timeout=5):
+                raise TimeoutError("preview_blocked event was not set in time")
+        return orig_save(self, *args, **kwargs)
+
+    results = {}
+    thread_errors = []
+
+    def do_archive():
+        try:
+            connection.close()
+            client = APIClient()
+            client.force_authenticate(user=user_a)
+            with patch.object(
+                WorkflowDefinition, "save", autospec=True, side_effect=intercept_archive_save
+            ):
+                res = client.post(
+                    f"/api/v1/workflows/{sample_workflow.id}/archive/",
+                    format="json",
+                )
+                results["archive_status"] = res.status_code
+        except Exception as exc:
+            thread_errors.append(exc)
+        finally:
+            connection.close()
+
+    def do_preview():
+        try:
+            connection.close()
+            if not archive_in_lock.wait(timeout=5):
+                raise TimeoutError("archive_in_lock event was not set in time")
+            client = APIClient()
+            client.force_authenticate(user=user_a)
+            res = client.post(
+                f"/api/v1/workflows/{sample_workflow.id}/preview/",
+                data={"source_job_id": str(sample_job.id)},
+                format="json",
+            )
+            results["preview_status"] = res.status_code
+            results["preview_data"] = res.json()
+        except Exception as exc:
+            thread_errors.append(exc)
+        finally:
+            connection.close()
+
+    t_archive = threading.Thread(target=do_archive)
+    t_preview = threading.Thread(target=do_preview)
+
+    t_archive.start()
+    t_preview.start()
+
+    assert wait_for_blocked_db_lock(timeout=5.0), "PREVIEW did not block on PostgreSQL lock"
+    preview_blocked.set()
+
+    t_archive.join(timeout=10)
+    t_preview.join(timeout=10)
+
+    assert not t_archive.is_alive()
+    assert not t_preview.is_alive()
+    assert not thread_errors, f"Exceptions in background threads: {thread_errors}"
+
+    assert results["archive_status"] == status.HTTP_200_OK
+    assert results["preview_status"] == status.HTTP_409_CONFLICT
+    assert "archived" in results["preview_data"]["detail"].lower()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_preview_wins_before_archive_completes_safely(
+    user_a, sample_workflow, sample_job
+):
+    """
+    Ordering Proof: PREVIEW -> ARCHIVE
+    Test scenario: PREVIEW acquires the row lock and snapshots definition.
+    ARCHIVE arrives and blocks on the PostgreSQL lock.
+    PREVIEW commits/releases lock and completes execution.
+    ARCHIVE unblocks and archives the definition.
+    """
+    preview_in_lock = threading.Event()
+    archive_blocked = threading.Event()
+
+    orig_select = WorkflowDefinition.objects.select_for_update
+
+    def intercept_select(*args, **kwargs):
+        qs = orig_select(*args, **kwargs)
+        orig_get = qs.get
+
+        def intercept_get(*g_args, **g_kwargs):
+            obj = orig_get(*g_args, **g_kwargs)
+            if getattr(obj, "id", None) == sample_workflow.id:
+                preview_in_lock.set()
+                if not archive_blocked.wait(timeout=5):
+                    raise TimeoutError("archive_blocked event was not set in time")
+            return obj
+
+        qs.get = intercept_get
+        return qs
+
+    results = {}
+    thread_errors = []
+
+    def do_preview():
+        try:
+            connection.close()
+            client = APIClient()
+            client.force_authenticate(user=user_a)
+            with patch.object(
+                WorkflowDefinition.objects,
+                "select_for_update",
+                side_effect=intercept_select,
+            ):
+                res = client.post(
+                    f"/api/v1/workflows/{sample_workflow.id}/preview/",
+                    data={"source_job_id": str(sample_job.id)},
+                    format="json",
+                )
+                results["preview_status"] = res.status_code
+                results["preview_data"] = res.json()
+        except Exception as exc:
+            thread_errors.append(exc)
+        finally:
+            connection.close()
+
+    def do_archive():
+        try:
+            connection.close()
+            if not preview_in_lock.wait(timeout=5):
+                raise TimeoutError("preview_in_lock event was not set in time")
+            client = APIClient()
+            client.force_authenticate(user=user_a)
+            res = client.post(
+                f"/api/v1/workflows/{sample_workflow.id}/archive/",
+                format="json",
+            )
+            results["archive_status"] = res.status_code
+        except Exception as exc:
+            thread_errors.append(exc)
+        finally:
+            connection.close()
+
+    t_preview = threading.Thread(target=do_preview)
+    t_archive = threading.Thread(target=do_archive)
+
+    t_preview.start()
+    t_archive.start()
+
+    assert wait_for_blocked_db_lock(timeout=5.0), "ARCHIVE did not block on PostgreSQL lock"
+    archive_blocked.set()
+
+    t_preview.join(timeout=10)
+    t_archive.join(timeout=10)
+
+    assert not t_preview.is_alive()
+    assert not t_archive.is_alive()
+    assert not thread_errors, f"Exceptions in background threads: {thread_errors}"
+
+    assert results["preview_status"] == status.HTTP_200_OK
+    assert results["archive_status"] == status.HTTP_200_OK
+
+    # Preview succeeded with active definition
+    assert results["preview_data"]["output_columns"] == ["id", "name"]
+    # Final database state is archived
+    sample_workflow.refresh_from_db()
+    assert sample_workflow.is_archived is True

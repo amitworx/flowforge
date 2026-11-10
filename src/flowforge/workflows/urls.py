@@ -6,6 +6,7 @@ from flowforge.workflows.views import (
     WorkflowDefinitionListCreateView,
     WorkflowExecuteAsyncRunView,
     WorkflowExecuteRunView,
+    WorkflowPreviewView,
     WorkflowRestoreView,
     WorkflowRunDetailView,
     WorkflowRunDownloadView,
@@ -24,6 +25,11 @@ urlpatterns = [
         "workflows/<uuid:uuid>/restore/",
         WorkflowRestoreView.as_view(),
         name="workflow-restore",
+    ),
+    path(
+        "workflows/<uuid:uuid>/preview/",
+        WorkflowPreviewView.as_view(),
+        name="workflow-preview",
     ),
     path(
         "workflows/<uuid:uuid>/runs/", WorkflowExecuteRunView.as_view(), name="workflow-run-create"
