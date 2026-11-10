@@ -488,8 +488,8 @@ FlowForge provides authenticated endpoints for downloading the completed results
      - *Client Limitations:* While single-quote prefixing is the industry-standard mitigation for CSV formula injection, spreadsheet software behavior can vary across client applications, locales, and import methods (e.g. direct double-click vs. Text Import Wizard). Some applications may show the leading quote or strip it upon re-saving.
 5. **Memory and Byte Limits (`413 Payload Too Large`):**
    - In addition to the existing 1,000-row and 10-step bounding limits, exports enforce a strict serialized UTF-8 byte guard (default `DEFAULT_MAX_EXPORT_SIZE_BYTES = 10 * 1024 * 1024`, or 10 MiB).
-   - Byte size is verified during serialization (incremental row tracking in CSV; encoded bytes check in JSON) against actual multi-byte UTF-8 payload lengths.
-   - If an export exceeds the configured byte threshold, the request is immediately aborted without emitting partial files and returns `413 Request Entity Too Large` (`{"detail": "Export payload exceeds the maximum allowed size of 10485760 bytes."}`).
+   - Byte size is verified incrementally during serialization (incremental row tracking in CSV; `json.JSONEncoder.iterencode` chunk accumulation in JSON) against actual multi-byte UTF-8 payload lengths, bounding memory before full serialization completes.
+   - If an export exceeds the configured byte threshold, serialization terminates immediately without emitting partial files and returns `413 Request Entity Too Large` (`{"detail": "Export payload exceeds the maximum allowed size of 10485760 bytes."}`).
 
 ## Troubleshooting
 

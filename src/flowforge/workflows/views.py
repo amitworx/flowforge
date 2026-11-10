@@ -13,6 +13,7 @@ from rest_framework.views import APIView
 from flowforge.processing.models import ProcessingJob
 from flowforge.processing.views import JobPagination
 from flowforge.workflows.export import (
+    DEFAULT_MAX_EXPORT_SIZE_BYTES,
     ExportPayloadTooLargeError,
     export_workflow_run_to_csv,
     export_workflow_run_to_json,
@@ -271,7 +272,9 @@ class WorkflowRunDownloadView(APIView):
 
         try:
             if export_format == "json":
-                content = export_workflow_run_to_json(output_data)
+                content = export_workflow_run_to_json(
+                    output_data, max_bytes=DEFAULT_MAX_EXPORT_SIZE_BYTES
+                )
                 response = HttpResponse(
                     content,
                     status=status.HTTP_200_OK,
@@ -283,7 +286,9 @@ class WorkflowRunDownloadView(APIView):
                 return response
 
             elif export_format == "csv":
-                content = export_workflow_run_to_csv(output_data, output_columns)
+                content = export_workflow_run_to_csv(
+                    output_data, output_columns, max_bytes=DEFAULT_MAX_EXPORT_SIZE_BYTES
+                )
                 response = HttpResponse(
                     content,
                     status=status.HTTP_200_OK,

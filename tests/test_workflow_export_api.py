@@ -258,21 +258,13 @@ def test_download_endpoint_payload_too_large_returns_413(
 ):
     run = execute_workflow_run(sample_export_workflow, sample_csv_job, test_user)
 
-    # Patch DEFAULT_MAX_EXPORT_SIZE_BYTES to a tiny limit (e.g. 5 bytes) to simulate oversized export
-    with patch("flowforge.workflows.views.export_workflow_run_to_json") as mock_json:
-        from flowforge.workflows.export import ExportPayloadTooLargeError
-
-        mock_json.side_effect = ExportPayloadTooLargeError(
-            "JSON export size exceeds maximum limit of 10485760 bytes."
-        )
+    # Real integration test exercising actual exporter logic and byte-cap enforcement
+    # by patching DEFAULT_MAX_EXPORT_SIZE_BYTES to a tiny limit (not mocking ExportPayloadTooLargeError)
+    with patch("flowforge.workflows.views.DEFAULT_MAX_EXPORT_SIZE_BYTES", 10):
         resp_json = auth_client.get(f"/api/v1/workflow-runs/{run.id}/download/?format=json")
         assert resp_json.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
         assert "exceeds" in resp_json.json()["detail"].lower()
 
-    with patch("flowforge.workflows.views.export_workflow_run_to_csv") as mock_csv:
-        mock_csv.side_effect = ExportPayloadTooLargeError(
-            "CSV export size exceeds maximum limit of 10485760 bytes."
-        )
         resp_csv = auth_client.get(f"/api/v1/workflow-runs/{run.id}/download/?format=csv")
         assert resp_csv.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
         assert "exceeds" in resp_csv.json()["detail"].lower()

@@ -164,12 +164,20 @@ def export_workflow_run_to_json(
     """
     Export workflow run data to a deterministic, UTF-8 encoded JSON byte string.
     Preserves scalar types, strings with leading zeros, Unicode, numbers, booleans, and nulls without modification.
-    Enforces max_bytes UTF-8 limit, raising ExportPayloadTooLargeError if exceeded.
+    Enforces max_bytes UTF-8 limit incrementally during serialization to bound memory.
+    Raises ExportPayloadTooLargeError as soon as accumulated UTF-8 bytes exceed max_bytes.
     """
-    json_str = json.dumps(output_data, ensure_ascii=False, indent=2)
-    raw_bytes = json_str.encode("utf-8")
-    if len(raw_bytes) > max_bytes:
-        raise ExportPayloadTooLargeError(
-            f"JSON export size ({len(raw_bytes)} bytes) exceeds maximum limit of {max_bytes} bytes."
-        )
-    return raw_bytes
+    encoder = json.JSONEncoder(ensure_ascii=False, indent=2)
+    accumulated_chunks: list[bytes] = []
+    current_bytes = 0
+
+    for chunk in encoder.iterencode(output_data):
+        encoded_chunk = chunk.encode("utf-8")
+        current_bytes += len(encoded_chunk)
+        if current_bytes > max_bytes:
+            raise ExportPayloadTooLargeError(
+                f"JSON export size exceeds maximum limit of {max_bytes} bytes."
+            )
+        accumulated_chunks.append(encoded_chunk)
+
+    return b"".join(accumulated_chunks)

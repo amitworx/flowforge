@@ -230,3 +230,29 @@ def test_export_exact_limit_boundary():
 
     with pytest.raises(ExportPayloadTooLargeError):
         export_workflow_run_to_json(data, max_bytes=exact_json_bytes - 1)
+
+
+def test_export_json_incremental_serialization_aborts_early():
+    from flowforge.workflows.export import ExportPayloadTooLargeError
+
+    class CountingDict(dict):
+        def __init__(self, *args, tracker, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._tracker = tracker
+
+        def items(self):
+            self._tracker.accessed += 1
+            return super().items()
+
+    class Tracker:
+        def __init__(self):
+            self.accessed = 0
+
+    tracker = Tracker()
+    data = [CountingDict({"id": i, "payload": "x" * 120}, tracker=tracker) for i in range(20)]
+    small_cap = 250
+
+    with pytest.raises(ExportPayloadTooLargeError):
+        export_workflow_run_to_json(data, max_bytes=small_cap)
+
+    assert 0 < tracker.accessed < 20
