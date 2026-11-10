@@ -42,6 +42,7 @@ class WorkflowRun(models.Model):
 
     class DispatchStatus(models.TextChoices):
         DISPATCHED = "dispatched", "Dispatched"
+        PUBLISHING = "publishing", "Publishing"
         FAILED = "failed", "Failed"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

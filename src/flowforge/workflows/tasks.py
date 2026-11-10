@@ -78,7 +78,11 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
             "Security invariant violation: WorkflowRun %s has mismatched ownership. Aborting execution.",
             run_id,
         )
-        WorkflowRun.objects.filter(id=run_id, claim_token=worker_token).update(
+        WorkflowRun.objects.filter(
+            id=run_id,
+            state=WorkflowRun.State.RUNNING,
+            claim_token=worker_token,
+        ).update(
             state=WorkflowRun.State.FAILED,
             output_data=[],
             input_row_count=0,
@@ -96,7 +100,11 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
             source_job.id,
             source_job.state,
         )
-        WorkflowRun.objects.filter(id=run_id, claim_token=worker_token).update(
+        WorkflowRun.objects.filter(
+            id=run_id,
+            state=WorkflowRun.State.RUNNING,
+            claim_token=worker_token,
+        ).update(
             state=WorkflowRun.State.FAILED,
             output_data=[],
             input_row_count=0,
@@ -110,7 +118,11 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
     step_snapshot = run.step_snapshot
     if not isinstance(step_snapshot, list):
         logger.warning("WorkflowRun %s has invalid step_snapshot format.", run_id)
-        WorkflowRun.objects.filter(id=run_id, claim_token=worker_token).update(
+        WorkflowRun.objects.filter(
+            id=run_id,
+            state=WorkflowRun.State.RUNNING,
+            claim_token=worker_token,
+        ).update(
             state=WorkflowRun.State.FAILED,
             output_data=[],
             input_row_count=0,
@@ -123,7 +135,11 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
     try:
         validate_step_definitions(step_snapshot)
     except WorkflowExecutionError as exc:
-        WorkflowRun.objects.filter(id=run_id, claim_token=worker_token).update(
+        WorkflowRun.objects.filter(
+            id=run_id,
+            state=WorkflowRun.State.RUNNING,
+            claim_token=worker_token,
+        ).update(
             state=WorkflowRun.State.FAILED,
             output_data=[],
             input_row_count=0,
@@ -143,8 +159,12 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
         )
 
         with transaction.atomic():
-            # Check fencing token before persisting
-            rows_updated = WorkflowRun.objects.filter(id=run_id, claim_token=worker_token).update(
+            # Check fencing token AND state=RUNNING before persisting
+            rows_updated = WorkflowRun.objects.filter(
+                id=run_id,
+                state=WorkflowRun.State.RUNNING,
+                claim_token=worker_token,
+            ).update(
                 state=WorkflowRun.State.COMPLETED,
                 output_data=output_data,
                 input_row_count=initial_input_row_count,
@@ -153,7 +173,7 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
             )
             if rows_updated == 0:
                 logger.warning(
-                    "Fencing conflict: WorkflowRun %s was reclaimed by another worker. Dropping results.",
+                    "Fencing conflict: WorkflowRun %s was reclaimed or terminally failed. Dropping results.",
                     run_id,
                 )
                 return
@@ -174,7 +194,11 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
 
     except WorkflowExecutionError as exc:
         with transaction.atomic():
-            rows_updated = WorkflowRun.objects.filter(id=run_id, claim_token=worker_token).update(
+            rows_updated = WorkflowRun.objects.filter(
+                id=run_id,
+                state=WorkflowRun.State.RUNNING,
+                claim_token=worker_token,
+            ).update(
                 state=WorkflowRun.State.FAILED,
                 output_data=[],
                 input_row_count=initial_input_row_count,
@@ -183,7 +207,10 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
                 finished_at=timezone.now(),
             )
             if rows_updated == 0:
-                logger.warning("Fencing conflict on failure: WorkflowRun %s was reclaimed.", run_id)
+                logger.warning(
+                    "Fencing conflict on failure: WorkflowRun %s was reclaimed or terminally failed.",
+                    run_id,
+                )
                 return
 
             step_objs = []
@@ -216,7 +243,11 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
     except Exception:
         logger.exception("Unexpected exception executing WorkflowRun %s", run_id)
         with transaction.atomic():
-            WorkflowRun.objects.filter(id=run_id, claim_token=worker_token).update(
+            WorkflowRun.objects.filter(
+                id=run_id,
+                state=WorkflowRun.State.RUNNING,
+                claim_token=worker_token,
+            ).update(
                 state=WorkflowRun.State.FAILED,
                 output_data=[],
                 input_row_count=initial_input_row_count,
