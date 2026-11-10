@@ -36,7 +36,8 @@ FlowForge is an open-source, self-hostable Python document-processing and workfl
 - Create workflow definition: `POST /api/v1/workflows/` (Authenticated)
 - List workflow definitions: `GET /api/v1/workflows/` (Authenticated)
 - Retrieve workflow definition: `GET /api/v1/workflows/{uuid}/` (Authenticated)
-- Execute workflow run: `POST /api/v1/workflows/{uuid}/runs/` (Authenticated)
+- Execute workflow run: `POST /api/v1/workflows/{uuid}/runs/` (Authenticated, Synchronous)
+- Enqueue async workflow run: `POST /api/v1/workflows/{uuid}/runs/async/` (Authenticated, Asynchronous)
 - List workflow runs: `GET /api/v1/workflow-runs/` (Authenticated)
 - Retrieve workflow run details: `GET /api/v1/workflow-runs/{uuid}/` (Authenticated)
 
@@ -307,6 +308,87 @@ RUN_ID=$(curl -s -X POST http://127.0.0.1:8001/api/v1/workflows/${WF_ID}/runs/ \
 # 3. Retrieve run details & step history
 curl -s -X GET http://127.0.0.1:8001/api/v1/workflow-runs/${RUN_ID}/ \
   -u devuser:devpass123 | jq .
+```
+
+---
+
+## Asynchronous Workflow Execution with Celery & Redis (M0-004)
+
+FlowForge provides opt-in asynchronous execution of workflows using Celery and Redis while strictly preserving the synchronous execution endpoint unchanged.
+
+```mermaid
+flowchart LR
+    Client["Client / API Caller"] -->|"POST /workflows/{id}/runs/async/"| API["FlowForge Web API"]
+    API -->|"1. Validate ownership & status"| DB[("PostgreSQL")]
+    API -->|"2. Create WorkflowRun (queued)"| DB
+    API -->|"3. transaction.on_commit(delay)"| Broker[("Redis Broker (Internal)")]
+    API -->|"4. HTTP 202 Accepted"| Client
+    Worker["Celery Worker"] -->|"5. Consume task"| Broker
+    Worker -->|"6. Atomic claim (queued -> running)"| DB
+    Worker -->|"7. Execute step_snapshot"| Engine["Workflow Pipeline Engine"]
+    Worker -->|"8. Persist completed/failed & audits"| DB
+    Client -->|"9. GET /workflow-runs/{id}/"| API
+```
+
+### Architecture & Safety Invariants
+- **Opt-in Endpoint:** Asynchronous execution is requested via `POST /api/v1/workflows/{uuid}/runs/async/`. When dispatch succeeds, it returns HTTP `202 Accepted` with state `"queued"` and status polling URL.
+- **Truthful Broker Dispatch & Fault Tolerance:** Direct broker publish failures (e.g., Redis down during `POST`) return HTTP `503 Service Unavailable` with recoverable metadata (`id`, `status_url`, `dispatch_status: "failed"`). The run is committed in PostgreSQL and can be recovered by the background recovery command without losing intent or returning misleading `202 Accepted`.
+- **Minimal Celery Payloads:** Celery messages carry strictly the database `run_id` and fencing token (never file content or user payloads).
+- **Worker Claim Atomicity & Strict Terminal Fencing:** Workers conditionally claim runs (`UPDATE ... WHERE state='queued'`). Legitimately running tasks cannot be stolen by concurrent workers or duplicate delivery messages. All worker persistence updates (success, failure, validation aborts, step audits) strictly require `state='running'` **and** matching `claim_token`. Whenever recovery marks a run terminally `FAILED`, it rotates the fencing claim token atomically, guaranteeing that zombie or delayed workers can never overwrite a terminal failure or persist orphan step audit records.
+- **Pre-execution Invariant Checks:** Workers independently verify that `run.owner == source_job.owner == workflow_definition.owner`, that `source_job.state == "completed"`, and that `step_snapshot` is a valid step definition list before executing pipeline operations. Mismatched or invalid inputs abort into a safe `FAILED` state.
+- **Internal Error Sanitization:** Unexpected worker crashes or broker connection errors log the complete traceback server-side and present safe, generic messages (e.g. `"Internal workflow execution error occurred."` or `"Broker unavailable during async dispatch. Run is recoverable."`) to API callers, ensuring raw database passwords, hostnames, or socket exceptions are never exposed via the API.
+- **Concurrency-Safe Bounded Recovery & Durable Reservations:** An explicit management command `python manage.py recover_workflow_runs` recovers stranded runs (`dispatch_status='failed'`, abandoned `publishing`/`dispatched` queued runs, and stale `running` runs beyond `--stale-minutes`). Recovery features:
+  - **Durable Two-Phase Reservation:** Implements a durable reservation state (`dispatch_status='publishing'`) locked via PostgreSQL `select_for_update(skip_locked=True)` so that competing recovery command invocations cannot double-claim or race to increment dispatch attempt counters even across row lock boundaries before broker publication completes.
+  - **Terminal-State Claim Fencing:** On every terminal transition, recovery rotates the claim token and sets `finished_at`, preventing late-running workers from mutating state.
+  - **Bounded Attempt Budget:** Applies a strict `--max-attempts` budget across both dispatch failures and stale-running recoveries. Runs exceeding the threshold transition terminally to `FAILED`.
+  - **Exponential Backoff:** Dispatches observe exponential backoff (`base * 2^(attempt - 2)`, default base 15s, capped at 15m) based on the timestamp of the last attempt (`started_at` or `created_at`) to prevent aggressive retry thrashing. An `--ignore-backoff` flag is provided for testing or operator overrides.
+  - **Unacknowledged Queued Detection:** Detects runs stranded in `queued` state with `dispatch_status=dispatched` or `publishing` after crash events exceeding the age threshold.
+  - **Argument Validation:** Enforces positive integers for `--max-attempts`, `--stale-minutes`, and `--limit`.
+- **Snapshot Execution:** Workers execute against the immutable `step_snapshot` persisted on `WorkflowRun`, ensuring subsequent mutations to `WorkflowDefinition` do not affect in-flight runs.
+- **Isolated Redis Network:** Redis in `docker-compose.yml` does **not** expose host ports; it is accessible solely across the internal Docker Compose bridge network.
+
+### Operational Recovery Command
+To reconcile stranded runs (e.g., after temporary Redis downtime or worker host termination):
+```bash
+# Docker Compose
+docker compose exec web python manage.py recover_workflow_runs --stale-minutes=15 --max-attempts=3 --limit=50 --action=requeue
+
+# Local (with optional --ignore-backoff for immediate emergency reconciliations)
+python manage.py recover_workflow_runs --stale-minutes=15 --max-attempts=3 --limit=50 --action=requeue
+```
+
+### cURL / PowerShell Examples
+
+#### Enqueue Asynchronous Workflow Run
+```bash
+curl -s -X POST http://127.0.0.1:8001/api/v1/workflows/<workflow_uuid>/runs/async/ \
+  -u devuser:devpass123 \
+  -H "Content-Type: application/json" \
+  -d '{"source_job_id": "<source_job_uuid>"}' | jq .
+```
+
+**Response (`202 Accepted`):**
+```json
+{
+  "id": "c1f77d54-159e-4c57-814c-e83cb2b6a506",
+  "workflow_definition": "8eab8562-99b7-4b66-ba65-71694096fe00",
+  "source_job": "6e1cf1d0-8695-494b-ba84-f6cbcd2f040f",
+  "state": "queued",
+  "status_url": "/api/v1/workflow-runs/c1f77d54-159e-4c57-814c-e83cb2b6a506/",
+  "created_at": "2026-11-09T09:40:00.123456Z"
+}
+```
+
+#### Poll Workflow Run Status
+```bash
+curl -s -X GET http://127.0.0.1:8001/api/v1/workflow-runs/<run_uuid>/ \
+  -u devuser:devpass123 | jq .
+```
+
+```powershell
+# PowerShell
+Invoke-RestMethod -Uri "http://127.0.0.1:8001/api/v1/workflow-runs/<run_uuid>/" `
+  -Headers @{ Authorization = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("devuser:devpass123")) }
 ```
 
 ---

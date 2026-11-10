@@ -22,6 +22,17 @@ services:
       retries: 5
       start_period: 5s
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Internal compose network only: NO host port published!
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 3s
+
   web:
     build:
       context: .
@@ -44,9 +55,38 @@ services:
       - DB_PASSWORD=${DB_PASSWORD:-flowforge}
       - DB_HOST=db
       - DB_PORT=5432
+      - CELERY_BROKER_URL=redis://redis:6379/0
       - PYTHONPATH=/app/src
     depends_on:
       db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: celery -A flowforge worker -l INFO
+    volumes:
+      - ./src:/app/src
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - SECRET_KEY=${SECRET_KEY:-insecure-dev-secret-key-change-in-production-only}
+      - DEBUG=${DEBUG:-True}
+      - DB_ENGINE=django.db.backends.postgresql
+      - DB_NAME=${DB_NAME:-flowforge}
+      - DB_USER=${DB_USER:-flowforge}
+      - DB_PASSWORD=${DB_PASSWORD:-flowforge}
+      - DB_HOST=db
+      - DB_PORT=5432
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - PYTHONPATH=/app/src
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
 volumes:

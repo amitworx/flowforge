@@ -1,3 +1,6 @@
+import logging
+
+from django.db import transaction
 from rest_framework import status
 from rest_framework.exceptions import NotFound
 from rest_framework.permissions import IsAuthenticated
@@ -9,12 +12,16 @@ from flowforge.processing.models import ProcessingJob
 from flowforge.processing.views import JobPagination
 from flowforge.workflows.models import WorkflowDefinition, WorkflowRun
 from flowforge.workflows.serializers import (
+    WorkflowAsyncRunResponseSerializer,
     WorkflowDefinitionSerializer,
     WorkflowRunCreateSerializer,
     WorkflowRunDetailSerializer,
     WorkflowRunListSerializer,
 )
 from flowforge.workflows.services import WorkflowServiceError, execute_workflow_run
+from flowforge.workflows.tasks import execute_workflow_run_task
+
+logger = logging.getLogger(__name__)
 
 
 class WorkflowDefinitionListCreateView(APIView):
@@ -94,6 +101,91 @@ class WorkflowExecuteRunView(APIView):
 
         run_serializer = WorkflowRunListSerializer(run)
         return Response(run_serializer.data, status=status.HTTP_201_CREATED)
+
+
+class WorkflowExecuteAsyncRunView(APIView):
+    """
+    POST /api/v1/workflows/{uuid}/runs/async/
+    Enqueues a background asynchronous run of a WorkflowDefinition against a ProcessingJob.
+    Returns HTTP 202 Accepted with state 'queued' and status URL if dispatched,
+    or HTTP 503 Service Unavailable if message broker publication fails, preserving
+    a recoverable persisted WorkflowRun state.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request: Request, uuid: str) -> Response:
+        try:
+            workflow_def = WorkflowDefinition.objects.get(id=uuid, owner=request.user)
+        except (WorkflowDefinition.DoesNotExist, ValueError):
+            return Response(
+                {"detail": "Workflow definition not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        serializer = WorkflowRunCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        source_job_id = serializer.validated_data["source_job_id"]
+
+        try:
+            source_job = ProcessingJob.objects.get(id=source_job_id, owner=request.user)
+        except (ProcessingJob.DoesNotExist, ValueError):
+            return Response(
+                {"detail": "Source processing job not found."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if source_job.state != ProcessingJob.State.COMPLETED:
+            return Response(
+                {
+                    "detail": f"Cannot execute workflow against source job in '{source_job.state}' state. Must be 'completed'."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        dispatch_error = None
+
+        with transaction.atomic():
+            run = WorkflowRun.objects.create(
+                owner=request.user,
+                workflow_definition=workflow_def,
+                source_job=source_job,
+                state=WorkflowRun.State.QUEUED,
+                dispatch_status=WorkflowRun.DispatchStatus.DISPATCHED,
+                step_snapshot=list(workflow_def.steps),
+                input_row_count=len(source_job.output_data or []),
+                output_row_count=0,
+            )
+
+            def _publish():
+                nonlocal dispatch_error
+                try:
+                    execute_workflow_run_task.delay(str(run.id), None)
+                except Exception as exc:
+                    dispatch_error = exc
+                    logger.exception(
+                        "Failed to publish task to Celery broker for WorkflowRun %s", run.id
+                    )
+                    WorkflowRun.objects.filter(id=run.id).update(
+                        dispatch_status=WorkflowRun.DispatchStatus.FAILED,
+                        error_summary="Broker unavailable during async dispatch. Run is recoverable.",
+                    )
+
+            transaction.on_commit(_publish)
+
+        if dispatch_error is not None:
+            run.refresh_from_db()
+            response_serializer = WorkflowAsyncRunResponseSerializer(run)
+            return Response(
+                {
+                    **response_serializer.data,
+                    "detail": "Broker unavailable; async dispatch deferred. Run recorded for recovery.",
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        response_serializer = WorkflowAsyncRunResponseSerializer(run)
+        return Response(response_serializer.data, status=status.HTTP_202_ACCEPTED)
 
 
 class WorkflowRunListView(APIView):

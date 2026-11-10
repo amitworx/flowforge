@@ -35,7 +35,14 @@ class WorkflowRun(models.Model):
     """
 
     class State(models.TextChoices):
+        QUEUED = "queued", "Queued"
+        RUNNING = "running", "Running"
         COMPLETED = "completed", "Completed"
+        FAILED = "failed", "Failed"
+
+    class DispatchStatus(models.TextChoices):
+        DISPATCHED = "dispatched", "Dispatched"
+        PUBLISHING = "publishing", "Publishing"
         FAILED = "failed", "Failed"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -58,6 +65,14 @@ class WorkflowRun(models.Model):
         max_length=20,
         choices=State.choices,
     )
+    dispatch_status = models.CharField(
+        max_length=20,
+        choices=DispatchStatus.choices,
+        default=DispatchStatus.DISPATCHED,
+        db_index=True,
+    )
+    dispatch_attempts = models.PositiveIntegerField(default=1)
+    claim_token = models.UUIDField(null=True, blank=True, db_index=True)
     step_snapshot = models.JSONField(
         help_text="Immutable snapshot of the steps executed in this run."
     )
@@ -70,6 +85,7 @@ class WorkflowRun(models.Model):
     output_row_count = models.PositiveIntegerField(default=0)
     error_summary = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:

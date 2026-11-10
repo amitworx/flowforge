@@ -33,6 +33,9 @@ class AppSettings(BaseSettings):
     DB_HOST: str = "localhost"
     DB_PORT: int = 5432
 
+    # Celery & Redis
+    CELERY_BROKER_URL: str = "redis://localhost:6379/0"
+
     # CORS & Security Defaults
     CORS_ALLOWED_ORIGINS: list[str] | str = []
 
