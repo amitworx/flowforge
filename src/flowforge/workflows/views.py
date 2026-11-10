@@ -1,8 +1,10 @@
 import logging
 
 from django.db import transaction
+from django.http import HttpResponse
 from rest_framework import status
 from rest_framework.exceptions import NotFound
+from rest_framework.negotiation import BaseContentNegotiation
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -10,6 +12,12 @@ from rest_framework.views import APIView
 
 from flowforge.processing.models import ProcessingJob
 from flowforge.processing.views import JobPagination
+from flowforge.workflows.export import (
+    DEFAULT_MAX_EXPORT_SIZE_BYTES,
+    ExportPayloadTooLargeError,
+    export_workflow_run_to_csv,
+    export_workflow_run_to_json,
+)
 from flowforge.workflows.models import WorkflowDefinition, WorkflowRun
 from flowforge.workflows.serializers import (
     WorkflowAsyncRunResponseSerializer,
@@ -219,3 +227,79 @@ class WorkflowRunDetailView(APIView):
     def get(self, request: Request, uuid: str) -> Response:
         run = self.get_object(uuid, request.user)
         return Response(WorkflowRunDetailSerializer(run).data, status=status.HTTP_200_OK)
+
+
+class IgnoreFormatContentNegotiation(BaseContentNegotiation):
+    def select_renderer(self, request, renderers, format_suffix=None):  # noqa: ARG002
+        return renderers[0], renderers[0].media_type
+
+
+class WorkflowRunDownloadView(APIView):
+    """
+    GET /api/v1/workflow-runs/{uuid}/download/?format=json|csv
+    Export and download the outputs of an already completed WorkflowRun.
+    """
+
+    permission_classes = [IsAuthenticated]
+    content_negotiation_class = IgnoreFormatContentNegotiation
+
+    def get_object(self, uuid: str, user) -> WorkflowRun:
+        try:
+            return WorkflowRun.objects.get(id=uuid, owner=user)
+        except (WorkflowRun.DoesNotExist, ValueError) as exc:
+            raise NotFound("Workflow run not found.") from exc
+
+    def get(self, request: Request, uuid: str) -> HttpResponse | Response:
+        run = self.get_object(uuid, request.user)
+
+        if run.state != WorkflowRun.State.COMPLETED:
+            return Response(
+                {
+                    "detail": f"Cannot export workflow run in '{run.state}' state. Run must be 'completed'."
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        export_format = request.query_params.get("format", "").lower().strip()
+        if export_format not in ("json", "csv"):
+            return Response(
+                {"detail": "Invalid export format. Must specify ?format=json or ?format=csv."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        output_data = run.output_data or []
+        output_columns = run.get_output_schema()
+
+        try:
+            if export_format == "json":
+                content = export_workflow_run_to_json(
+                    output_data, max_bytes=DEFAULT_MAX_EXPORT_SIZE_BYTES
+                )
+                response = HttpResponse(
+                    content,
+                    status=status.HTTP_200_OK,
+                    content_type="application/json; charset=utf-8",
+                )
+                response["Content-Disposition"] = (
+                    f'attachment; filename="workflow-run-{run.id}.json"'
+                )
+                return response
+
+            elif export_format == "csv":
+                content = export_workflow_run_to_csv(
+                    output_data, output_columns, max_bytes=DEFAULT_MAX_EXPORT_SIZE_BYTES
+                )
+                response = HttpResponse(
+                    content,
+                    status=status.HTTP_200_OK,
+                    content_type="text/csv; charset=utf-8",
+                )
+                response["Content-Disposition"] = (
+                    f'attachment; filename="workflow-run-{run.id}.csv"'
+                )
+                return response
+        except ExportPayloadTooLargeError as exc:
+            return Response(
+                {"detail": exc.message},
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )

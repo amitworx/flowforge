@@ -237,15 +237,15 @@ def execute_step_with_schema(
     raise WorkflowExecutionError(f"Unsupported operation '{op}'")
 
 
-def execute_workflow_pipeline(
+def execute_workflow_pipeline_with_schema(
     data: list[dict[str, Any]],
     steps: list[dict[str, Any]],
     schema: list[str] | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     """
     Execute an ordered pipeline of steps against data.
     Propagates deterministic schema across all steps, even if intermediate data becomes empty.
-    Returns (output_data, step_audits).
+    Returns (output_data, step_audits, final_schema).
     Raises WorkflowExecutionError on failure, preserving completed step audits.
     """
     validate_step_definitions(steps)
@@ -294,4 +294,17 @@ def execute_workflow_pipeline(
                 failed_step_audit=failed_audit,
             ) from exc
 
-    return current_data, completed_audits
+    return current_data, completed_audits, current_schema
+
+
+def execute_workflow_pipeline(
+    data: list[dict[str, Any]],
+    steps: list[dict[str, Any]],
+    schema: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Execute an ordered pipeline of steps against data.
+    Preserves backward compatibility returning (output_data, step_audits).
+    """
+    output_data, audits, _schema = execute_workflow_pipeline_with_schema(data, steps, schema=schema)
+    return output_data, audits

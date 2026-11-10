@@ -81,6 +81,11 @@ class WorkflowRun(models.Model):
         blank=True,
         help_text="Bounded normalized output JSON resulting from successful pipeline execution.",
     )
+    output_columns = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Ordered list of final schema column names for completed workflow output.",
+    )
     input_row_count = models.PositiveIntegerField(default=0)
     output_row_count = models.PositiveIntegerField(default=0)
     error_summary = models.TextField(blank=True, null=True)
@@ -93,6 +98,22 @@ class WorkflowRun(models.Model):
 
     def __str__(self) -> str:
         return f"Run {self.id} - {self.state}"
+
+    def get_output_schema(self) -> list[str]:
+        if self.output_columns and isinstance(self.output_columns, list):
+            return list(self.output_columns)
+        if self.output_data and len(self.output_data) > 0 and isinstance(self.output_data[0], dict):
+            return list(self.output_data[0].keys())
+
+        from flowforge.workflows.export import derive_workflow_schema
+
+        initial_schema = []
+        if self.source_job and self.source_job.column_names:
+            initial_schema = list(self.source_job.column_names)
+        elif self.source_job and self.source_job.output_data:
+            initial_schema = list(self.source_job.output_data[0].keys())
+
+        return derive_workflow_schema(initial_schema, self.step_snapshot or [])
 
 
 class WorkflowStepRun(models.Model):

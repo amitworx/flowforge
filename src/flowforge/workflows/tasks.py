@@ -157,6 +157,9 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
         output_data, step_audits = execute_workflow_pipeline(
             input_data, step_snapshot, schema=initial_schema
         )
+        from flowforge.workflows.export import derive_workflow_schema
+
+        final_schema = derive_workflow_schema(initial_schema, step_snapshot)
 
         with transaction.atomic():
             # Check fencing token AND state=RUNNING before persisting
@@ -167,6 +170,7 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
             ).update(
                 state=WorkflowRun.State.COMPLETED,
                 output_data=output_data,
+                output_columns=final_schema,
                 input_row_count=initial_input_row_count,
                 output_row_count=len(output_data),
                 finished_at=timezone.now(),

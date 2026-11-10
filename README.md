@@ -40,6 +40,7 @@ FlowForge is an open-source, self-hostable Python document-processing and workfl
 - Enqueue async workflow run: `POST /api/v1/workflows/{uuid}/runs/async/` (Authenticated, Asynchronous)
 - List workflow runs: `GET /api/v1/workflow-runs/` (Authenticated)
 - Retrieve workflow run details: `GET /api/v1/workflow-runs/{uuid}/` (Authenticated)
+- Export and download workflow run results: `GET /api/v1/workflow-runs/{uuid}/download/?format=json|csv` (Authenticated)
 
 ---
 
@@ -450,6 +451,45 @@ pip-audit -r requirements.txt
 ```
 
 ---
+
+
+---
+
+## Workflow Run Result Export API (M0-005)
+
+FlowForge provides authenticated endpoints for downloading the completed results of a `WorkflowRun` as either standard JSON or CSV.
+
+### Endpoint Specification
+- **URL:** `GET /api/v1/workflow-runs/{uuid}/download/?format=json|csv`
+- **Method:** `GET`
+- **Authentication:** Required (session or basic authentication in development; TLS/HTTPS required in production).
+- **Parameters:**
+  - `format` (query param, required): Must be either `json` or `csv`.
+
+### Security and Behavioral Guarantees
+1. **Ownership & Indistinguishable Rejection:**
+   - Only the user who owns the workflow run may export it.
+   - Cross-user requests and nonexistent UUIDs return identical `404 Not Found` (`{"detail": "Workflow run not found."}`) to eliminate object enumeration vectors.
+2. **Terminal State Gate:**
+   - Incomplete runs (`queued`, `running`) or `failed` runs return `409 Conflict` (`{"detail": "Cannot export workflow run in '<state>' state. Run must be 'completed'."}`). Partial or misleading execution results cannot be exported.
+   - Exporting is strictly read-only and never triggers execution side-effects.
+3. **JSON Export (`?format=json`):**
+   - **Content-Type:** `application/json; charset=utf-8`
+   - **Content-Disposition:** `attachment; filename="workflow-run-{uuid}.json"`
+   - Emits deterministic, formatted UTF-8 JSON. Scalars, booleans, nulls, floats, and strings with leading zeros (e.g. `"00123"`) are preserved exactly without mutation.
+4. **CSV Export (`?format=csv`):**
+   - **Content-Type:** `text/csv; charset=utf-8`
+   - **Content-Disposition:** `attachment; filename="workflow-run-{uuid}.csv"`
+   - **Zero-Row Completed Runs:** When an execution successfully yields zero rows (e.g. filtered to empty), it produces a header-only CSV using the authoritative final workflow schema (persisted in `output_columns` or derived dynamically).
+   - **Scalar Encoding:** Strings preserve leading zeros; `null` values output as empty string `""`; `true`/`false` booleans output as `"true"`/`"false"`. Escaping follows RFC 4180 rules via standard Python `csv.writer`.
+   - **Spreadsheet Formula Injection Defense (CSV / DDE Injection):**
+     - Cell values or column headers starting with dangerous trigger characters (`=`, `+`, `-`, `@`, `\t`, `\r`, `\n`, `\x0b`, `\x0c`), including those preceded by Unicode whitespace (e.g. non-breaking space `U+00A0`), control characters (Unicode category `Cc` such as vertical tab and form feed), format characters (Unicode category `Cf` such as byte-order marks `U+FEFF`, zero-width spaces `U+200B`..`U+200D`, and soft hyphens `U+00AD`), or space/line separators (Unicode categories `Zs`, `Zl`, `Zp`), are safely sanitized on export by prefixing with a single quote (`'`).
+     - This neutralizes formula and dynamic data exchange (DDE) execution in spreadsheet software (such as Microsoft Excel, Google Sheets, or LibreOffice Calc) without altering the underlying database or JSON data.
+     - *Client Limitations:* While single-quote prefixing is the industry-standard mitigation for CSV formula injection, spreadsheet software behavior can vary across client applications, locales, and import methods (e.g. direct double-click vs. Text Import Wizard). Some applications may show the leading quote or strip it upon re-saving.
+5. **Memory and Byte Limits (`413 Payload Too Large`):**
+   - In addition to the existing 1,000-row and 10-step bounding limits, exports enforce a strict serialized UTF-8 byte guard (default `DEFAULT_MAX_EXPORT_SIZE_BYTES = 10 * 1024 * 1024`, or 10 MiB).
+   - Byte size is verified incrementally during serialization (incremental row tracking in CSV; `json.JSONEncoder.iterencode` chunk accumulation in JSON) against actual multi-byte UTF-8 payload lengths, bounding memory before full serialization completes.
+   - If an export exceeds the configured byte threshold, serialization terminates immediately without emitting partial files and returns `413 Request Entity Too Large` (`{"detail": "Export payload exceeds the maximum allowed size of 10485760 bytes."}`).
 
 ## Troubleshooting
 
