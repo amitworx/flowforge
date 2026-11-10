@@ -6,6 +6,7 @@ from flowforge.workflows.views import (
     WorkflowExecuteAsyncRunView,
     WorkflowExecuteRunView,
     WorkflowRunDetailView,
+    WorkflowRunDownloadView,
     WorkflowRunListView,
 )
 
@@ -22,4 +23,9 @@ urlpatterns = [
     ),
     path("workflow-runs/", WorkflowRunListView.as_view(), name="workflow-run-list"),
     path("workflow-runs/<uuid:uuid>/", WorkflowRunDetailView.as_view(), name="workflow-run-detail"),
+    path(
+        "workflow-runs/<uuid:uuid>/download/",
+        WorkflowRunDownloadView.as_view(),
+        name="workflow-run-download",
+    ),
 ]

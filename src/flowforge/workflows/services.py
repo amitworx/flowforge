@@ -4,7 +4,10 @@ from django.db import transaction
 from django.utils import timezone
 
 from flowforge.processing.models import ProcessingJob
-from flowforge.workflows.engine import WorkflowExecutionError, execute_workflow_pipeline
+from flowforge.workflows.engine import (
+    WorkflowExecutionError,
+    execute_workflow_pipeline_with_schema,
+)
 from flowforge.workflows.models import WorkflowDefinition, WorkflowRun, WorkflowStepRun
 
 
@@ -39,7 +42,7 @@ def execute_workflow_run(
     initial_schema = source_job.column_names or (list(input_data[0].keys()) if input_data else [])
 
     try:
-        output_data, step_audits = execute_workflow_pipeline(
+        output_data, step_audits, final_schema = execute_workflow_pipeline_with_schema(
             input_data, step_snapshot, schema=initial_schema
         )
 
@@ -51,6 +54,7 @@ def execute_workflow_run(
                 state=WorkflowRun.State.COMPLETED,
                 step_snapshot=step_snapshot,
                 output_data=output_data,
+                output_columns=final_schema,
                 input_row_count=initial_input_row_count,
                 output_row_count=len(output_data),
                 finished_at=timezone.now(),

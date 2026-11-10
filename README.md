@@ -40,6 +40,7 @@ FlowForge is an open-source, self-hostable Python document-processing and workfl
 - Enqueue async workflow run: `POST /api/v1/workflows/{uuid}/runs/async/` (Authenticated, Asynchronous)
 - List workflow runs: `GET /api/v1/workflow-runs/` (Authenticated)
 - Retrieve workflow run details: `GET /api/v1/workflow-runs/{uuid}/` (Authenticated)
+- Export and download workflow run results: `GET /api/v1/workflow-runs/{uuid}/download/?format=json|csv` (Authenticated)
 
 ---
 
@@ -450,6 +451,42 @@ pip-audit -r requirements.txt
 ```
 
 ---
+
+
+---
+
+## Workflow Run Result Export API (M0-005)
+
+FlowForge provides authenticated endpoints for downloading the completed results of a `WorkflowRun` as either standard JSON or CSV.
+
+### Endpoint Specification
+- **URL:** `GET /api/v1/workflow-runs/{uuid}/download/?format=json|csv`
+- **Method:** `GET`
+- **Authentication:** Required (session or basic authentication in development; TLS/HTTPS required in production).
+- **Parameters:**
+  - `format` (query param, required): Must be either `json` or `csv`.
+
+### Security and Behavioral Guarantees
+1. **Ownership & Indistinguishable Rejection:**
+   - Only the user who owns the workflow run may export it.
+   - Cross-user requests and nonexistent UUIDs return identical `404 Not Found` (`{"detail": "Workflow run not found."}`) to eliminate object enumeration vectors.
+2. **Terminal State Gate:**
+   - Incomplete runs (`queued`, `running`) or `failed` runs return `409 Conflict` (`{"detail": "Cannot export workflow run in '<state>' state. Run must be 'completed'."}`). Partial or misleading execution results cannot be exported.
+   - Exporting is strictly read-only and never triggers execution side-effects.
+3. **JSON Export (`?format=json`):**
+   - **Content-Type:** `application/json; charset=utf-8`
+   - **Content-Disposition:** `attachment; filename="workflow-run-{uuid}.json"`
+   - Emits deterministic, formatted UTF-8 JSON. Scalars, booleans, nulls, floats, and strings with leading zeros (e.g. `"00123"`) are preserved exactly without mutation.
+4. **CSV Export (`?format=csv`):**
+   - **Content-Type:** `text/csv; charset=utf-8`
+   - **Content-Disposition:** `attachment; filename="workflow-run-{uuid}.csv"`
+   - **Zero-Row Completed Runs:** When an execution successfully yields zero rows (e.g. filtered to empty), it produces a header-only CSV using the authoritative final workflow schema (persisted in `output_columns` or derived dynamically).
+   - **Scalar Encoding:** Strings preserve leading zeros; `null` values output as empty string `""`; `true`/`false` booleans output as `"true"`/`"false"`. Escaping follows RFC 4180 rules via standard Python `csv.writer`.
+   - **Spreadsheet Formula Injection Defense (CSV / DDE Injection):**
+     - Cell values or column headers starting with dangerous trigger characters (`=`, `+`, `-`, `@`, `\t`, `\r`, `\n`), including those preceded by whitespace or control characters, are safely sanitized on export by prefixing with a single quote (`'`).
+     - This neutralizes formula execution in spreadsheet software (such as Excel or LibreOffice Calc) without altering the underlying database or JSON data.
+5. **Memory and Size Bounds:**
+   - Inherits the 1,000-row and 10-step bounding limits established in prior milestones, preventing unconstrained memory consumption or response buffering.
 
 ## Troubleshooting
 
