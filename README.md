@@ -483,10 +483,13 @@ FlowForge provides authenticated endpoints for downloading the completed results
    - **Zero-Row Completed Runs:** When an execution successfully yields zero rows (e.g. filtered to empty), it produces a header-only CSV using the authoritative final workflow schema (persisted in `output_columns` or derived dynamically).
    - **Scalar Encoding:** Strings preserve leading zeros; `null` values output as empty string `""`; `true`/`false` booleans output as `"true"`/`"false"`. Escaping follows RFC 4180 rules via standard Python `csv.writer`.
    - **Spreadsheet Formula Injection Defense (CSV / DDE Injection):**
-     - Cell values or column headers starting with dangerous trigger characters (`=`, `+`, `-`, `@`, `\t`, `\r`, `\n`), including those preceded by whitespace or control characters, are safely sanitized on export by prefixing with a single quote (`'`).
-     - This neutralizes formula execution in spreadsheet software (such as Excel or LibreOffice Calc) without altering the underlying database or JSON data.
-5. **Memory and Size Bounds:**
-   - Inherits the 1,000-row and 10-step bounding limits established in prior milestones, preventing unconstrained memory consumption or response buffering.
+     - Cell values or column headers starting with dangerous trigger characters (`=`, `+`, `-`, `@`, `\t`, `\r`, `\n`, `\x0b`, `\x0c`), including those preceded by Unicode whitespace (e.g. non-breaking space `U+00A0`), control characters (Unicode category `Cc` such as vertical tab and form feed), format characters (Unicode category `Cf` such as byte-order marks `U+FEFF`, zero-width spaces `U+200B`..`U+200D`, and soft hyphens `U+00AD`), or space/line separators (Unicode categories `Zs`, `Zl`, `Zp`), are safely sanitized on export by prefixing with a single quote (`'`).
+     - This neutralizes formula and dynamic data exchange (DDE) execution in spreadsheet software (such as Microsoft Excel, Google Sheets, or LibreOffice Calc) without altering the underlying database or JSON data.
+     - *Client Limitations:* While single-quote prefixing is the industry-standard mitigation for CSV formula injection, spreadsheet software behavior can vary across client applications, locales, and import methods (e.g. direct double-click vs. Text Import Wizard). Some applications may show the leading quote or strip it upon re-saving.
+5. **Memory and Byte Limits (`413 Payload Too Large`):**
+   - In addition to the existing 1,000-row and 10-step bounding limits, exports enforce a strict serialized UTF-8 byte guard (default `DEFAULT_MAX_EXPORT_SIZE_BYTES = 10 * 1024 * 1024`, or 10 MiB).
+   - Byte size is verified during serialization (incremental row tracking in CSV; encoded bytes check in JSON) against actual multi-byte UTF-8 payload lengths.
+   - If an export exceeds the configured byte threshold, the request is immediately aborted without emitting partial files and returns `413 Request Entity Too Large` (`{"detail": "Export payload exceeds the maximum allowed size of 10485760 bytes."}`).
 
 ## Troubleshooting
 

@@ -4,6 +4,8 @@ import csv
 import io
 import json
 
+import pytest
+
 from flowforge.workflows.export import (
     derive_workflow_schema,
     export_workflow_run_to_csv,
@@ -141,3 +143,90 @@ def test_export_workflow_run_to_json():
     assert loaded == output_data
     assert loaded[0]["code"] == "00123"
     assert loaded[0]["name"] == "München Über"
+
+
+def test_sanitize_csv_cell_unicode_whitespace_and_control_chars():
+    """Verify Unicode whitespace, control, and zero-width characters concealing formula triggers are safely escaped."""
+    # Vertical tab (\x0b) and Form feed (\x0c)
+    assert sanitize_csv_cell("\x0b=SUM(A1:A10)") == "'\x0b=SUM(A1:A10)"
+    assert sanitize_csv_cell("\x0c+CMD('calc')") == "'\x0c+CMD('calc')"
+    assert sanitize_csv_cell("\x0bmalicious") == "'\x0bmalicious"
+    assert sanitize_csv_cell("\x0cmalicious") == "'\x0cmalicious"
+
+    # Non-breaking space (U+00A0)
+    assert sanitize_csv_cell("\u00a0=1+1") == "'\u00a0=1+1"
+    assert sanitize_csv_cell("\u00a0\u00a0-5*5") == "'\u00a0\u00a0-5*5"
+
+    # BOM (U+FEFF) and Zero-width spaces / format characters (U+200B..U+200F, U+2060)
+    assert sanitize_csv_cell("\ufeff=1+1") == "'\ufeff=1+1"
+    assert sanitize_csv_cell("\u200b=SUM(1)") == "'\u200b=SUM(1)"
+    assert sanitize_csv_cell("\u200c+cmd") == "'\u200c+cmd"
+    assert sanitize_csv_cell("\u200d-cmd") == "'\u200d-cmd"
+    assert sanitize_csv_cell("\u200e@cmd") == "'\u200e@cmd"
+    assert sanitize_csv_cell("\u2060=SUM(A1)") == "'\u2060=SUM(A1)"
+
+    # Multiple intermixed whitespace/control/format characters
+    assert sanitize_csv_cell(" \t\x0b\xa0\ufeff\u200b=1+1") == "' \t\x0b\xa0\ufeff\u200b=1+1"
+
+    # Benign Unicode strings with symbols or accents are untouched
+    assert sanitize_csv_cell("München Über") == "München Über"
+    assert sanitize_csv_cell("日本語テキスト") == "日本語テキスト"
+    assert sanitize_csv_cell("Emoji 🚀") == "Emoji 🚀"
+    assert sanitize_csv_cell("100 €") == "100 €"
+
+
+def test_export_byte_limit_exceeded_raises_error():
+    """Verify export functions raise ExportPayloadTooLargeError when UTF-8 bytes exceed byte limit."""
+    from flowforge.workflows.export import (
+        ExportPayloadTooLargeError,
+    )
+
+    # Multi-byte UTF-8 character where byte count > character count
+    # '€' is 3 UTF-8 bytes; '🚀' is 4 UTF-8 bytes
+    small_limit = 50
+    large_row = [{"data": "€" * 20}]  # 20 * 3 = 60 bytes of data alone
+
+    with pytest.raises(ExportPayloadTooLargeError) as exc_csv:
+        export_workflow_run_to_csv(
+            output_data=large_row,
+            output_columns=["data"],
+            max_bytes=small_limit,
+        )
+    assert "exceeds" in str(exc_csv.value).lower()
+
+    with pytest.raises(ExportPayloadTooLargeError) as exc_json:
+        export_workflow_run_to_json(
+            output_data=large_row,
+            max_bytes=small_limit,
+        )
+    assert "exceeds" in str(exc_json.value).lower()
+
+
+def test_export_exact_limit_boundary():
+    """Verify exports exactly at or below the limit succeed, while exceeding by 1 byte fails."""
+    from flowforge.workflows.export import ExportPayloadTooLargeError
+
+    data = [{"col": "a"}]
+    cols = ["col"]
+
+    # Calculate exact CSV length
+    exact_csv = export_workflow_run_to_csv(data, cols, max_bytes=1000)
+    exact_csv_bytes = len(exact_csv.encode("utf-8"))
+
+    # At exact limit -> succeeds
+    res_at_limit = export_workflow_run_to_csv(data, cols, max_bytes=exact_csv_bytes)
+    assert res_at_limit == exact_csv
+
+    # 1 byte below required -> raises ExportPayloadTooLargeError
+    with pytest.raises(ExportPayloadTooLargeError):
+        export_workflow_run_to_csv(data, cols, max_bytes=exact_csv_bytes - 1)
+
+    # Calculate exact JSON length
+    exact_json = export_workflow_run_to_json(data, max_bytes=1000)
+    exact_json_bytes = len(exact_json)
+
+    res_json_at_limit = export_workflow_run_to_json(data, max_bytes=exact_json_bytes)
+    assert res_json_at_limit == exact_json
+
+    with pytest.raises(ExportPayloadTooLargeError):
+        export_workflow_run_to_json(data, max_bytes=exact_json_bytes - 1)

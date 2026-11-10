@@ -13,6 +13,7 @@ from rest_framework.views import APIView
 from flowforge.processing.models import ProcessingJob
 from flowforge.processing.views import JobPagination
 from flowforge.workflows.export import (
+    ExportPayloadTooLargeError,
     export_workflow_run_to_csv,
     export_workflow_run_to_json,
 )
@@ -268,22 +269,32 @@ class WorkflowRunDownloadView(APIView):
         output_data = run.output_data or []
         output_columns = run.get_output_schema()
 
-        if export_format == "json":
-            content = export_workflow_run_to_json(output_data)
-            response = HttpResponse(
-                content,
-                status=status.HTTP_200_OK,
-                content_type="application/json; charset=utf-8",
-            )
-            response["Content-Disposition"] = f'attachment; filename="workflow-run-{run.id}.json"'
-            return response
+        try:
+            if export_format == "json":
+                content = export_workflow_run_to_json(output_data)
+                response = HttpResponse(
+                    content,
+                    status=status.HTTP_200_OK,
+                    content_type="application/json; charset=utf-8",
+                )
+                response["Content-Disposition"] = (
+                    f'attachment; filename="workflow-run-{run.id}.json"'
+                )
+                return response
 
-        elif export_format == "csv":
-            content = export_workflow_run_to_csv(output_data, output_columns)
-            response = HttpResponse(
-                content,
-                status=status.HTTP_200_OK,
-                content_type="text/csv; charset=utf-8",
+            elif export_format == "csv":
+                content = export_workflow_run_to_csv(output_data, output_columns)
+                response = HttpResponse(
+                    content,
+                    status=status.HTTP_200_OK,
+                    content_type="text/csv; charset=utf-8",
+                )
+                response["Content-Disposition"] = (
+                    f'attachment; filename="workflow-run-{run.id}.csv"'
+                )
+                return response
+        except ExportPayloadTooLargeError as exc:
+            return Response(
+                {"detail": exc.message},
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             )
-            response["Content-Disposition"] = f'attachment; filename="workflow-run-{run.id}.csv"'
-            return response
