@@ -33,6 +33,7 @@ from flowforge.workflows.serializers import (
     WorkflowPreviewResponseSerializer,
     WorkflowRunCreateSerializer,
     WorkflowRunDetailSerializer,
+    WorkflowRunFilterSerializer,
     WorkflowRunListSerializer,
 )
 from flowforge.workflows.services import WorkflowServiceError, execute_workflow_run
@@ -347,12 +348,39 @@ class WorkflowExecuteAsyncRunView(APIView):
 class WorkflowRunListView(APIView):
     """
     GET /api/v1/workflow-runs/
+    Enhanced with owner-isolated filtering, sorting, and stable deterministic pagination.
     """
 
     permission_classes = [IsAuthenticated]
 
     def get(self, request: Request) -> Response:
+        filter_serializer = WorkflowRunFilterSerializer(data=request.query_params)
+        filter_serializer.is_valid(raise_exception=True)
+        validated = filter_serializer.validated_data
+
         queryset = WorkflowRun.objects.filter(owner=request.user)
+
+        if "workflow_definition" in validated:
+            queryset = queryset.filter(workflow_definition_id=validated["workflow_definition"])
+
+        if "source_job" in validated:
+            queryset = queryset.filter(source_job_id=validated["source_job"])
+
+        if "state" in validated:
+            queryset = queryset.filter(state=validated["state"])
+
+        if "created_from_dt" in validated:
+            queryset = queryset.filter(created_at__gte=validated["created_from_dt"])
+
+        if "created_to_dt" in validated:
+            queryset = queryset.filter(created_at__lte=validated["created_to_dt"])
+
+        ordering_param = validated.get("ordering", "-created_at")
+        if ordering_param == "created_at":
+            queryset = queryset.order_by("created_at", "id")
+        else:
+            queryset = queryset.order_by("-created_at", "-id")
+
         paginator = JobPagination()
         page = paginator.paginate_queryset(queryset, request, view=self)
         serializer = WorkflowRunListSerializer(page, many=True, context={"request": request})
