@@ -1,3 +1,4 @@
+import copy
 import logging
 
 from django.db import transaction
@@ -13,6 +14,7 @@ from rest_framework.views import APIView
 
 from flowforge.processing.models import ProcessingJob
 from flowforge.processing.views import JobPagination
+from flowforge.workflows.clone_service import generate_cloned_workflow_name
 from flowforge.workflows.engine import (
     WorkflowExecutionError,
     execute_workflow_pipeline_with_schema,
@@ -27,6 +29,7 @@ from flowforge.workflows.export import (
 from flowforge.workflows.models import WorkflowDefinition, WorkflowRun
 from flowforge.workflows.serializers import (
     WorkflowAsyncRunResponseSerializer,
+    WorkflowCloneRequestSerializer,
     WorkflowDefinitionSerializer,
     WorkflowDefinitionUpdateSerializer,
     WorkflowPreviewRequestSerializer,
@@ -601,4 +604,50 @@ class WorkflowPreviewView(APIView):
             serialized_bytes,
             status=status.HTTP_200_OK,
             content_type="application/json; charset=utf-8",
+        )
+
+
+class WorkflowCloneView(APIView):
+    """
+    POST /api/v1/workflows/{uuid}/clone/
+    Owner-isolated safe clone of a workflow definition.
+    Produces an active, independent clone with no copied runs or side effects.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request: Request, uuid: str) -> Response:
+        serializer = WorkflowCloneRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        explicit_name = serializer.validated_data.get("name")
+
+        try:
+            with transaction.atomic():
+                try:
+                    source_wf = WorkflowDefinition.objects.select_for_update().get(
+                        id=uuid, owner=request.user
+                    )
+                except (WorkflowDefinition.DoesNotExist, ValueError):
+                    return Response(
+                        {"detail": "Workflow definition not found."},
+                        status=status.HTTP_404_NOT_FOUND,
+                    )
+
+                target_name = explicit_name or generate_cloned_workflow_name(source_wf.name)
+                cloned_steps = copy.deepcopy(source_wf.steps)
+
+                cloned_wf = WorkflowDefinition.objects.create(
+                    owner=request.user,
+                    name=target_name,
+                    steps=cloned_steps,
+                    is_archived=False,
+                    archived_at=None,
+                )
+        except Exception:
+            raise
+
+        response_data = WorkflowDefinitionSerializer(cloned_wf, context={"request": request}).data
+        location = f"/api/v1/workflows/{cloned_wf.id}/"
+        return Response(
+            response_data, status=status.HTTP_201_CREATED, headers={"Location": location}
         )

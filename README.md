@@ -639,6 +639,64 @@ curl -s -u devuser:devpass123 \
   "http://127.0.0.1:8001/api/v1/workflow-runs/?workflow_definition=<uuid>&state=completed&created_from=2026-11-01T00:00:00Z&ordering=-created_at" | jq .
 ```
 
+
+---
+
+## Safe Workflow Definition Cloning (M0-009)
+
+FlowForge provides an owner-isolated, safe, and non-destructive cloning endpoint via `POST /api/v1/workflows/{uuid}/clone/`.
+
+### 1. API Contract & Behavior
+- **Method:** `POST /api/v1/workflows/{uuid}/clone/`
+- **Authentication:** Required (owner only). Foreign or non-existent UUIDs return an indistinguishable `404 Not Found`. Anonymous requests return `401 Unauthorized` / `403 Forbidden`.
+- **Request Body:** Optional JSON object:
+  ```json
+  {
+    "name": "Optional Custom Name"
+  }
+  ```
+- **Name Derivation & Validation:**
+  - If `name` is omitted or empty in JSON, the system automatically derives a name using `<source name> (copy)`.
+  - If `<source name> (copy)` exceeds 128 characters, the source prefix is deterministically truncated to fit within the 128-character limit.
+  - If `name` is explicitly provided, it is validated against standard workflow creation constraints: whitespace is stripped, cannot be empty, must be a string, and cannot exceed 128 characters. Explicit names are never silently truncated; exceeding 128 characters yields `400 Bad Request`.
+  - Non-object payloads or unknown payload fields return `400 Bad Request`.
+- **Response Format (`201 Created`):**
+  - Returns the standard `WorkflowDefinitionSerializer` object representation with a fresh `id` UUID, `owner=request.user`, fresh timestamps, and a copy of the validated steps.
+  - Returns a `Location` header pointing to `/api/v1/workflows/{new_uuid}/`.
+  - Repeated clone requests produce distinct workflow definitions with unique UUIDs.
+
+### 2. State Isolation & Historical Integrity
+- **Cloning Archived Definitions:**
+  - An owner may clone an **archived** workflow definition.
+  - The resulting clone is always created in the **active** state (`is_archived=false`, `archived_at=null`).
+  - Archiving the source workflow does not invalidate or prevent cloning.
+- **Deep Step Isolation:**
+  - Cloned definitions receive a completely isolated deep copy of the source steps.
+  - Subsequent edits (`PATCH`) to the original definition do not affect the clone, and vice versa.
+- **Zero Run Duplication & Side Effects:**
+  - Existing historical runs, step audit records, and export files remain attached exclusively to the original workflow definition.
+  - No new `WorkflowRun` or `WorkflowStepRun` records and no Celery background tasks are created by cloning.
+
+### 3. Concurrency & Linearizable Row-Level Locking
+- When cloning, FlowForge acquires a brief row-level lock on the source definition using `select_for_update()` inside a short atomic database transaction:
+  - The source's name, steps, and archive status are captured in a single serialized database snapshot.
+  - The transaction commits immediately upon inserting the new clone record before serializing the HTTP response.
+  - This locking discipline serializes cleanly against concurrent `PATCH`, `archive`, and `restore` operations, guaranteeing that a clone captures either the complete pre-update or complete post-update definition, never a torn or partial state.
+
+```bash
+# Example 1: Clone with default generated name (e.g. "Pipeline (copy)")
+curl -s -X POST http://127.0.0.1:8001/api/v1/workflows/<uuid>/clone/ \
+  -u devuser:devpass123 \
+  -H "Content-Type: application/json" \
+  -d '{}' | jq .
+
+# Example 2: Clone with an explicit custom name
+curl -s -X POST http://127.0.0.1:8001/api/v1/workflows/<uuid>/clone/ \
+  -u devuser:devpass123 \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Customer Pipeline - Staging Variant"}' | jq .
+```
+
 ## Troubleshooting
 
 - **Port Conflict (`listen tcp 127.0.0.1:8000: bind`):**
