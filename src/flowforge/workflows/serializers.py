@@ -19,6 +19,9 @@ class WorkflowDefinitionSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "is_archived", "archived_at", "created_at", "updated_at"]
 
     def validate_name(self, value):
+        raw_name = self.initial_data.get("name")
+        if not isinstance(raw_name, str):
+            raise serializers.ValidationError("Workflow name must be a string.")
         stripped = value.strip()
         if not stripped:
             raise serializers.ValidationError("Workflow name cannot be empty.")
@@ -70,6 +73,9 @@ class WorkflowDefinitionUpdateSerializer(serializers.ModelSerializer):
         return super().to_internal_value(data)
 
     def validate_name(self, value):
+        raw_name = self.initial_data.get("name")
+        if not isinstance(raw_name, str):
+            raise serializers.ValidationError("Workflow name must be a string.")
         stripped = value.strip()
         if not stripped:
             raise serializers.ValidationError("Workflow name cannot be empty.")
@@ -273,3 +279,42 @@ class WorkflowRunFilterSerializer(serializers.Serializer):
             )
 
         return attrs
+
+
+class WorkflowCloneRequestSerializer(serializers.Serializer):
+    """
+    Serializer for POST /api/v1/workflows/{uuid}/clone/ payload.
+    Optional 'name' string (1-128 chars). Rejects unknown fields and malformed payloads.
+    """
+
+    name = serializers.CharField(required=False, allow_blank=False, max_length=128)
+
+    def to_internal_value(self, data):
+        if not isinstance(data, dict):
+            raise serializers.ValidationError(
+                {"detail": "Invalid payload format. Expected a JSON object."}
+            )
+
+        allowed_fields = {"name"}
+        input_keys = set(data.keys())
+        unknown_fields = input_keys - allowed_fields
+        if unknown_fields:
+            raise serializers.ValidationError(
+                dict.fromkeys(
+                    sorted(unknown_fields),
+                    "Unknown field. Only 'name' is accepted.",
+                )
+            )
+
+        return super().to_internal_value(data)
+
+    def validate_name(self, value):
+        raw_name = self.initial_data.get("name")
+        if not isinstance(raw_name, str):
+            raise serializers.ValidationError("Workflow name must be a string.")
+        stripped = value.strip()
+        if not stripped:
+            raise serializers.ValidationError("Workflow name cannot be empty.")
+        if len(stripped) > 128:
+            raise serializers.ValidationError("Workflow name cannot exceed 128 characters.")
+        return stripped

@@ -2,6 +2,7 @@ from django.urls import path
 
 from flowforge.workflows.views import (
     WorkflowArchiveView,
+    WorkflowCloneView,
     WorkflowDefinitionDetailView,
     WorkflowDefinitionListCreateView,
     WorkflowExecuteAsyncRunView,
@@ -16,6 +17,11 @@ from flowforge.workflows.views import (
 urlpatterns = [
     path("workflows/", WorkflowDefinitionListCreateView.as_view(), name="workflow-list-create"),
     path("workflows/<uuid:uuid>/", WorkflowDefinitionDetailView.as_view(), name="workflow-detail"),
+    path(
+        "workflows/<uuid:uuid>/clone/",
+        WorkflowCloneView.as_view(),
+        name="workflow-clone",
+    ),
     path(
         "workflows/<uuid:uuid>/archive/",
         WorkflowArchiveView.as_view(),
