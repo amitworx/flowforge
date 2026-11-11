@@ -2,6 +2,8 @@ import copy
 import logging
 
 from django.db import transaction
+from django.db.models import Count, Q, Sum
+from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status
@@ -39,6 +41,7 @@ from flowforge.workflows.serializers import (
     WorkflowRunDetailSerializer,
     WorkflowRunFilterSerializer,
     WorkflowRunListSerializer,
+    WorkflowRunSummaryFilterSerializer,
 )
 from flowforge.workflows.services import WorkflowServiceError, execute_workflow_run
 from flowforge.workflows.tasks import execute_workflow_run_task
@@ -389,6 +392,70 @@ class WorkflowRunListView(APIView):
         page = paginator.paginate_queryset(queryset, request, view=self)
         serializer = WorkflowRunListSerializer(page, many=True, context={"request": request})
         return paginator.get_paginated_response(serializer.data)
+
+
+class WorkflowRunSummaryView(APIView):
+    """
+    GET /api/v1/workflow-runs/summary/
+    Owner-isolated bounded execution summary with database-side aggregation.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request: Request) -> Response:
+        filter_serializer = WorkflowRunSummaryFilterSerializer(data=request.query_params)
+        filter_serializer.is_valid(raise_exception=True)
+        validated = filter_serializer.validated_data
+
+        queryset = WorkflowRun.objects.filter(owner=request.user)
+
+        if "workflow_definition" in validated:
+            queryset = queryset.filter(workflow_definition_id=validated["workflow_definition"])
+
+        if "source_job" in validated:
+            queryset = queryset.filter(source_job_id=validated["source_job"])
+
+        if "created_from_dt" in validated:
+            queryset = queryset.filter(created_at__gte=validated["created_from_dt"])
+
+        if "created_to_dt" in validated:
+            queryset = queryset.filter(created_at__lte=validated["created_to_dt"])
+
+        aggregates = queryset.aggregate(
+            total_runs=Count("id"),
+            queued=Count("id", filter=Q(state=WorkflowRun.State.QUEUED)),
+            running=Count("id", filter=Q(state=WorkflowRun.State.RUNNING)),
+            completed=Count("id", filter=Q(state=WorkflowRun.State.COMPLETED)),
+            failed=Count("id", filter=Q(state=WorkflowRun.State.FAILED)),
+            completed_input_rows=Coalesce(
+                Sum("input_row_count", filter=Q(state=WorkflowRun.State.COMPLETED)), 0
+            ),
+            completed_output_rows=Coalesce(
+                Sum("output_row_count", filter=Q(state=WorkflowRun.State.COMPLETED)), 0
+            ),
+        )
+
+        completed_count = aggregates["completed"]
+        failed_count = aggregates["failed"]
+        terminal_count = completed_count + failed_count
+
+        success_rate = round(completed_count / terminal_count, 2) if terminal_count > 0 else None
+
+        return Response(
+            {
+                "total_runs": aggregates["total_runs"],
+                "by_state": {
+                    "queued": aggregates["queued"],
+                    "running": aggregates["running"],
+                    "completed": aggregates["completed"],
+                    "failed": aggregates["failed"],
+                },
+                "completed_input_rows": aggregates["completed_input_rows"],
+                "completed_output_rows": aggregates["completed_output_rows"],
+                "success_rate": success_rate,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class WorkflowRunDetailView(APIView):
