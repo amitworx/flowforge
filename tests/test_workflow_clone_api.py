@@ -31,7 +31,7 @@ def other_client(django_user_model):
 def sample_steps():
     return [
         {"op": "select_columns", "columns": ["id", "name", "department"]},
-        {"op": "filter_rows", "column": "department", "operator": "equals", "value": "Engineering"},
+        {"op": "filter_equals", "column": "department", "value": "Engineering"},
     ]
 
 
@@ -275,3 +275,82 @@ class TestWorkflowCloneAPI:
         assert id1 != id2
         assert id1 != str(source_workflow.id)
         assert id2 != str(source_workflow.id)
+
+    def test_cloned_workflow_is_previewable_and_executable(self, auth_client, source_workflow):
+        # 1. Clone source
+        clone_url = f"/api/v1/workflows/{source_workflow.id}/clone/"
+        res_clone = auth_client.post(clone_url, {}, format="json")
+        assert res_clone.status_code == status.HTTP_201_CREATED
+        clone_id = res_clone.json()["id"]
+
+        # 2. Ingest processing job matching schema
+        job = ProcessingJob.objects.create(
+            owner=auth_client.user,
+            file_type="csv",
+            state=ProcessingJob.State.COMPLETED,
+            original_filename="sample.csv",
+            column_names=["id", "name", "department"],
+            output_data=[
+                {"id": 1, "name": "Alice", "department": "Engineering"},
+                {"id": 2, "name": "Bob", "department": "Marketing"},
+                {"id": 3, "name": "Charlie", "department": "Engineering"},
+            ],
+        )
+
+        # 3. Preview cloned workflow
+        preview_url = f"/api/v1/workflows/{clone_id}/preview/"
+        res_preview = auth_client.post(preview_url, {"source_job_id": str(job.id)}, format="json")
+        assert res_preview.status_code == status.HTTP_200_OK
+        preview_data = res_preview.json()
+        assert preview_data["output_row_count"] == 2
+        assert preview_data["preview_rows"] == [
+            {"id": 1, "name": "Alice", "department": "Engineering"},
+            {"id": 3, "name": "Charlie", "department": "Engineering"},
+        ]
+
+        # 4. Execute synchronous run on cloned workflow
+        run_url = f"/api/v1/workflows/{clone_id}/runs/"
+        res_run = auth_client.post(run_url, {"source_job_id": str(job.id)}, format="json")
+        assert res_run.status_code == status.HTTP_201_CREATED
+        run_data = res_run.json()
+        assert run_data["state"] == "completed"
+        assert run_data["output_row_count"] == 2
+
+    def test_clone_fails_on_corrupt_or_legacy_source_steps_with_400(self, auth_client):
+        # Corrupt test cases: unsupported op, missing required field, invalid shape, >10 steps
+        corrupt_cases = [
+            # 1. Unsupported operation (e.g. legacy 'filter_rows')
+            [{"op": "filter_rows", "column": "dept", "operator": "equals", "value": "x"}],
+            # 2. Missing required field in select_columns
+            [{"op": "select_columns"}],
+            # 3. Non-dictionary step
+            ["not_a_dict"],
+            # 4. More than 10 steps
+            [{"op": "select_columns", "columns": ["id"]}] * 11,
+            # 5. Invalid filter_equals (non-scalar value)
+            [{"op": "filter_equals", "column": "dept", "value": {"nested": "obj"}}],
+        ]
+
+        initial_count = WorkflowDefinition.objects.count()
+
+        for bad_steps in corrupt_cases:
+            # Create directly in database bypassing DRF serializer validation
+            corrupt_wf = WorkflowDefinition.objects.create(
+                owner=auth_client.user,
+                name="Legacy Corrupt Pipeline",
+                steps=bad_steps,
+            )
+
+            clone_url = f"/api/v1/workflows/{corrupt_wf.id}/clone/"
+            res = auth_client.post(clone_url, {}, format="json")
+            assert res.status_code == status.HTTP_400_BAD_REQUEST
+            err_data = res.json()
+            assert "detail" in err_data
+            assert "invalid" in err_data["detail"].lower()
+
+            # Ensure original is unchanged
+            corrupt_wf.refresh_from_db()
+            assert corrupt_wf.steps == bad_steps
+
+        # Ensure zero new WorkflowDefinitions were created
+        assert WorkflowDefinition.objects.count() == initial_count + len(corrupt_cases)

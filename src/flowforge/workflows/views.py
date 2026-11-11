@@ -18,6 +18,7 @@ from flowforge.workflows.clone_service import generate_cloned_workflow_name
 from flowforge.workflows.engine import (
     WorkflowExecutionError,
     execute_workflow_pipeline_with_schema,
+    validate_step_definitions,
 )
 from flowforge.workflows.export import (
     DEFAULT_MAX_EXPORT_SIZE_BYTES,
@@ -633,8 +634,16 @@ class WorkflowCloneView(APIView):
                         status=status.HTTP_404_NOT_FOUND,
                     )
 
+                try:
+                    validated_steps = validate_step_definitions(source_wf.steps)
+                except WorkflowExecutionError as exc:
+                    return Response(
+                        {"detail": f"Source workflow steps are invalid: {exc.message}"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
                 target_name = explicit_name or generate_cloned_workflow_name(source_wf.name)
-                cloned_steps = copy.deepcopy(source_wf.steps)
+                cloned_steps = copy.deepcopy(validated_steps)
 
                 cloned_wf = WorkflowDefinition.objects.create(
                     owner=request.user,

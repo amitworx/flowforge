@@ -670,8 +670,12 @@ FlowForge provides an owner-isolated, safe, and non-destructive cloning endpoint
   - An owner may clone an **archived** workflow definition.
   - The resulting clone is always created in the **active** state (`is_archived=false`, `archived_at=null`).
   - Archiving the source workflow does not invalidate or prevent cloning.
+- **Source Step Validation (Defensive Clone Guarantee):**
+  - Before creating the clone, the system executes pure step validation (`validate_step_definitions`) on the source's stored steps under the database row lock.
+  - If a legacy or corrupt workflow definition contains invalid operations, missing fields, or invalid shapes, cloning fails fast with structured `400 Bad Request` (`{"detail": "Source workflow steps are invalid: ..."}`) without leaking stack traces.
+  - Zero new workflow definitions or runs are created upon validation failure, and the source definition remains unchanged.
 - **Deep Step Isolation:**
-  - Cloned definitions receive a completely isolated deep copy of the source steps.
+  - Cloned definitions receive a completely isolated deep copy of validated steps.
   - Subsequent edits (`PATCH`) to the original definition do not affect the clone, and vice versa.
 - **Zero Run Duplication & Side Effects:**
   - Existing historical runs, step audit records, and export files remain attached exclusively to the original workflow definition.
