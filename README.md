@@ -598,6 +598,47 @@ FlowForge provides a pre-run, read-only preview API allowing users to inspect tr
 
 ---
 
+
+---
+
+## Workflow Run History Filtering and Pagination (M0-008)
+
+FlowForge provides comprehensive query filtering, sorting, and stable deterministic pagination for workflow execution history via `GET /api/v1/workflow-runs/`.
+
+### 1. Supported Query Parameters
+
+| Parameter | Type | Description |
+|:---|:---|:---|
+| `workflow_definition` | UUID | Filter runs triggered by a specific workflow definition owned by the user. |
+| `state` | string (`queued`, `running`, `completed`, `failed`) | Filter runs by execution status enum. |
+| `source_job` | UUID | Filter runs using a specific input ingestion job owned by the user. |
+| `created_from` | ISO 8601 string | Inclusive lower bound for run creation time (must include timezone, e.g. `2026-11-01T00:00:00Z` or `+05:30`). |
+| `created_to` | ISO 8601 string | Inclusive upper bound for run creation time (must include timezone, e.g. `2026-11-02T23:59:59Z`). |
+| `ordering` | string (`-created_at`, `created_at`) | Sort order. `-created_at` (default) sorts latest first; `created_at` sorts oldest first. Stable tie-breaker is `id`. |
+| `page` | integer | Page number for pagination (DRF `PageNumberPagination`). |
+| `page_size` | integer | Number of runs per page. |
+
+### 2. Validation & Error Handling (`400 Bad Request`)
+- **Strict Query Parameter Allowlist:** Any query parameter other than the allowed filters and pagination parameters (`created_from`, `created_to`, `ordering`, `page`, `page_size`, `source_job`, `state`, `workflow_definition`) results in `400 Bad Request`.
+- **UUID Format:** Invalid UUID strings for `workflow_definition` or `source_job` return `400 Bad Request`.
+- **State Enum:** Invalid state values return `400 Bad Request` with DRF choice error.
+- **Timezone-Aware Datetimes:** Datetimes must parse to valid ISO 8601 and be timezone-aware (e.g. UTC `Z` or explicit offset). Naive datetimes without timezone information return `400 Bad Request`.
+- **Inverted Time Ranges:** If `created_from` is strictly later than `created_to`, returns `400 Bad Request`.
+- **Supported Ordering:** Values other than `-created_at` and `created_at` return `400 Bad Request`.
+
+### 3. List Semantics & Owner Isolation
+- **Filter Composition:** All filters compose using boolean `AND`.
+- **Safe Empty Responses (`200 OK`):** If a query specifies a valid UUID for a workflow definition or source job that does not exist or belongs to another user, the endpoint returns an empty paginated list (`200 OK`, `count: 0, results: []`), never returning `404 Not Found` or leaking existence metadata.
+- **Historical Runs from Archived Workflows:** Historical workflow runs executed against workflows that were subsequently archived remain completely visible in run history and can still be filtered by `workflow_definition`.
+- **Deterministic Pagination:** Ordering always applies a deterministic tie-breaker (`("-created_at", "-id")` for `-created_at` and `("created_at", "id")` for `created_at`), ensuring reliable and stable pagination without duplicates or skipped records across pages.
+- **Zero Side Effects:** Queries are strictly read-only and never trigger state changes or Celery task publications.
+
+```bash
+# Example: Filter completed runs for a specific workflow created in November 2026
+curl -s -u devuser:devpass123 \
+  "http://127.0.0.1:8001/api/v1/workflow-runs/?workflow_definition=<uuid>&state=completed&created_from=2026-11-01T00:00:00Z&ordering=-created_at" | jq .
+```
+
 ## Troubleshooting
 
 - **Port Conflict (`listen tcp 127.0.0.1:8000: bind`):**

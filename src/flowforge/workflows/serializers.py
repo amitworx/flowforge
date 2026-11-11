@@ -200,3 +200,76 @@ class WorkflowPreviewResponseSerializer(serializers.Serializer):
     preview_limit = serializers.IntegerField()
     preview_rows = serializers.ListField(child=serializers.DictField())
     step_audits = WorkflowPreviewStepAuditSerializer(many=True)
+
+
+class WorkflowRunFilterSerializer(serializers.Serializer):
+    ALLOWED_PARAMS = {
+        "workflow_definition",
+        "state",
+        "source_job",
+        "created_from",
+        "created_to",
+        "ordering",
+        "page",
+        "page_size",
+    }
+
+    workflow_definition = serializers.UUIDField(required=False)
+    source_job = serializers.UUIDField(required=False)
+    state = serializers.ChoiceField(choices=WorkflowRun.State.choices, required=False)
+    created_from = serializers.CharField(required=False)
+    created_to = serializers.CharField(required=False)
+    ordering = serializers.ChoiceField(
+        choices=["-created_at", "created_at"], required=False, default="-created_at"
+    )
+
+    def validate(self, attrs):
+        # Check unknown parameters from initial data
+        unknown = set(self.initial_data.keys()) - self.ALLOWED_PARAMS
+        if unknown:
+            raise serializers.ValidationError(
+                dict.fromkeys(
+                    sorted(unknown),
+                    f"Unknown query parameter. Allowed parameters are: {sorted(self.ALLOWED_PARAMS)}.",
+                )
+            )
+
+        from django.utils import timezone
+        from django.utils.dateparse import parse_datetime
+
+        def _parse_iso_aware(val: str, field_name: str):
+            val_clean = val.strip()
+            # Standard URL query decoding converts unencoded '+' into a space (' ')
+            # Restore '+' if the part after space looks like a timezone offset
+            if " " in val_clean and ("+" not in val_clean and not val_clean.endswith("Z")):
+                parts = val_clean.split(" ")
+                if len(parts) == 2 and (":" in parts[1] or len(parts[1]) == 4):
+                    val_clean = f"{parts[0]}+{parts[1]}"
+
+            dt = parse_datetime(val_clean)
+            if dt is None:
+                raise serializers.ValidationError({field_name: "Invalid ISO 8601 datetime format."})
+            if not timezone.is_aware(dt):
+                raise serializers.ValidationError(
+                    {field_name: "Datetime must be timezone-aware (e.g. UTC 'Z' or offset)."}
+                )
+            return dt
+
+        created_from_str = attrs.get("created_from")
+        if created_from_str:
+            attrs["created_from_dt"] = _parse_iso_aware(created_from_str, "created_from")
+
+        created_to_str = attrs.get("created_to")
+        if created_to_str:
+            attrs["created_to_dt"] = _parse_iso_aware(created_to_str, "created_to")
+
+        if (
+            "created_from_dt" in attrs
+            and "created_to_dt" in attrs
+            and attrs["created_from_dt"] > attrs["created_to_dt"]
+        ):
+            raise serializers.ValidationError(
+                {"created_from": "'created_from' cannot be later than 'created_to'."}
+            )
+
+        return attrs
