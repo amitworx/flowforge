@@ -229,8 +229,9 @@ class TestWorkflowRunHistoryFilters:
         ids = [item["id"] for item in data["results"]]
         assert ids == [str(test_data["run2"].id), str(test_data["run1"].id)]
 
-    def test_filter_by_datetime_with_timezone_offset(self, auth_client):
+    def test_filter_by_datetime_with_timezone_offset(self, auth_client, test_data):
         # t0 is 2026-11-01T12:00:00Z. In +05:30 that is 2026-11-01T17:30:00+05:30
+        _ = test_data
         t_from_offset = "2026-11-01T17:30:00+05:30"
         t_to_offset = "2026-11-01T18:30:00+05:30"
         url = f"/api/v1/workflow-runs/?created_from={t_from_offset}&created_to={t_to_offset}"
