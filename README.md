@@ -701,6 +701,79 @@ curl -s -X POST http://127.0.0.1:8001/api/v1/workflows/<uuid>/clone/ \
   -d '{"name": "Customer Pipeline - Staging Variant"}' | jq .
 ```
 
+
+---
+
+## Workflow Execution Summary API (M0-010)
+
+FlowForge provides an owner-isolated, high-performance execution summary endpoint via `GET /api/v1/workflow-runs/summary/`.
+
+### 1. API Contract & Response Format
+- **Method:** `GET /api/v1/workflow-runs/summary/`
+- **Authentication:** Required (owner only). Returns `401 Unauthorized` / `403 Forbidden` for unauthenticated requests.
+- **Stable Response Shape:**
+  ```json
+  {
+    "total_runs": 12,
+    "by_state": {
+      "queued": 1,
+      "running": 1,
+      "completed": 8,
+      "failed": 2
+    },
+    "completed_input_rows": 2400,
+    "completed_output_rows": 1950,
+    "success_rate": 0.8
+  }
+  ```
+
+### 2. Metrics & Aggregation Semantics
+- **Database-Side Aggregation:** Computations are evaluated entirely within PostgreSQL via Django ORM database-side aggregation (`Count`, `Sum`, `Q`, `Coalesce`) in a single query.
+- **`total_runs`:** Total count of workflow runs owned by the authenticated user matching all filter criteria.
+- **`by_state`:** Exact breakdown for every possible execution state: `queued`, `running`, `completed`, and `failed`.
+- **`completed_input_rows` & `completed_output_rows`:** Sum of input and output row counts exclusively for runs in the `completed` state. Failed and running runs are excluded from row totals to prevent misleading metrics. Default is `0`.
+- **`success_rate`:** Calculated as `completed / (completed + failed)` rounded to two decimal places in the range `[0.00, 1.00]`.
+  - Non-terminal states (`queued` and `running`) are excluded from the denominator.
+  - If there are zero terminal runs (`completed + failed == 0`), `success_rate` returns `null`.
+
+### 3. Supported Query Filters
+The summary endpoint accepts a subset of filters matching the run list endpoint:
+
+| Parameter | Type | Description |
+|:---|:---|:---|
+| `workflow_definition` | UUID | Filter summary to runs triggered by a specific workflow definition owned by the user. |
+| `source_job` | UUID | Filter summary to runs using a specific input ingestion job owned by the user. |
+| `created_from` | ISO 8601 string | Inclusive lower bound for run creation time (must include timezone, e.g. `2026-11-01T00:00:00Z` or `+05:30`). |
+| `created_to` | ISO 8601 string | Inclusive upper bound for run creation time (must include timezone, e.g. `2026-11-02T23:59:59Z`). |
+
+- **Strict Validation (`400 Bad Request`):**
+  - Parameters unsupported on summary (such as `state`, `page`, `page_size`, and `ordering`) or unknown query parameters are rejected with `400 Bad Request`.
+  - Naive datetimes without timezone information and inverted ranges (`created_from > created_to`) return `400 Bad Request`.
+  - Invalid UUIDs return `400 Bad Request`.
+- **Safe Empty Responses (`200 OK`):**
+  - If filtered by a valid UUID for a workflow definition or source job that does not exist or belongs to another user, returns a standard empty summary:
+    ```json
+    {
+      "total_runs": 0,
+      "by_state": {"queued": 0, "running": 0, "completed": 0, "failed": 0},
+      "completed_input_rows": 0,
+      "completed_output_rows": 0,
+      "success_rate": null
+    }
+    ```
+- **Historical Runs:** Preserves historical runs from archived workflows.
+- **Strict Read-Only:** Causes zero database mutations, Celery dispatches, or side effects.
+
+```bash
+# Example 1: Global workflow run summary
+curl -s -u devuser:devpass123 \
+  "http://127.0.0.1:8001/api/v1/workflow-runs/summary/" | jq .
+
+# Example 2: Filter summary by workflow definition and datetime range
+curl -s -u devuser:devpass123 \
+  "http://127.0.0.1:8001/api/v1/workflow-runs/summary/?workflow_definition=<uuid>&created_from=2026-11-01T00:00:00Z&created_to=2026-11-30T23:59:59Z" | jq .
+```
+
 ## Troubleshooting
 
 - **Port Conflict (`listen tcp 127.0.0.1:8000: bind`):**
