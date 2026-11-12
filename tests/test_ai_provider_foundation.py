@@ -92,7 +92,7 @@ class TestDataContracts:
                 max_output_tokens=0,
             )
 
-        with pytest.raises(InvalidRequestError, match="timeout_seconds must be positive"):
+        with pytest.raises(InvalidRequestError, match="timeout_seconds must be a positive"):
             LLMRequest(
                 model="test",
                 messages=[ChatMessage(role=ChatRole.USER, content="Hi")],

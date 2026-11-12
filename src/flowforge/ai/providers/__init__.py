@@ -17,6 +17,9 @@ from flowforge.ai.providers.openai import OpenAICompatibleProvider
 from flowforge.ai.providers.transport import HTTPTransport, StdlibHTTPTransport
 from flowforge.ai.providers.types import (
     MAX_MESSAGES_COUNT,
+    MAX_MODEL_NAME_LEN,
+    MAX_OUTPUT_TOKENS_LIMIT,
+    MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
     MAX_TOTAL_REQUEST_CHARS,
     ChatMessage,
@@ -36,6 +39,9 @@ __all__ = [
     "LLMRequest",
     "LLMResponse",
     "MAX_MESSAGES_COUNT",
+    "MAX_MODEL_NAME_LEN",
+    "MAX_OUTPUT_TOKENS_LIMIT",
+    "MAX_REQUEST_BYTES",
     "MAX_RESPONSE_BYTES",
     "MAX_TOTAL_REQUEST_CHARS",
     "OllamaProvider",

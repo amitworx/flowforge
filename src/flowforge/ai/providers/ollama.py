@@ -7,11 +7,13 @@ from typing import Any
 
 from flowforge.ai.providers.base import LLMProvider
 from flowforge.ai.providers.exceptions import (
+    InvalidRequestError,
     ProviderError,
     ProviderResponseError,
 )
 from flowforge.ai.providers.transport import HTTPTransport
 from flowforge.ai.providers.types import (
+    MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
     LLMRequest,
     LLMResponse,
@@ -37,7 +39,12 @@ class OllamaProvider(LLMProvider):
             allow_custom_host=allow_custom_host,
             default_loopback_only=True,
         )
-        super().__init__(base_url=validated_url, api_key=None, transport=transport)
+        super().__init__(
+            base_url=validated_url,
+            api_key=None,
+            transport=transport,
+            allow_loopback=True,
+        )
 
     def generate(self, request: LLMRequest) -> LLMResponse:
         endpoint = f"{self.base_url}/api/chat"
@@ -53,6 +60,11 @@ class OllamaProvider(LLMProvider):
         }
 
         body_bytes = json.dumps(payload).encode("utf-8")
+        if len(body_bytes) > MAX_REQUEST_BYTES:
+            raise InvalidRequestError(
+                f"Request body size exceeds maximum allowed bytes ({len(body_bytes)} > {MAX_REQUEST_BYTES})"
+            )
+
         headers = {"Content-Type": "application/json"}
 
         try:
@@ -74,8 +86,8 @@ class OllamaProvider(LLMProvider):
 
             try:
                 data = json.loads(resp_bytes.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError) as err:
-                raise ProviderResponseError("Invalid JSON response from Ollama") from err
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise ProviderResponseError("Invalid JSON response from Ollama") from None
 
             if not isinstance(data, dict):
                 raise ProviderResponseError("Malformed response structure from Ollama")
@@ -85,21 +97,31 @@ class OllamaProvider(LLMProvider):
                 raise ProviderResponseError("Missing expected message output from Ollama response")
 
             text = msg_obj.get("content", "")
+            if not isinstance(text, str):
+                raise ProviderResponseError("Invalid content type in Ollama response message")
+
             model_name = data.get("model", request.model)
 
             prompt_tokens = data.get("prompt_eval_count")
             eval_tokens = data.get("eval_count")
             usage: TokenUsage | None = None
             if prompt_tokens is not None and eval_tokens is not None:
-                usage = TokenUsage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=eval_tokens,
-                    total_tokens=prompt_tokens + eval_tokens,
-                )
+                try:
+                    usage = TokenUsage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=eval_tokens,
+                        total_tokens=prompt_tokens + eval_tokens,
+                    )
+                except Exception:
+                    raise ProviderResponseError(
+                        "Invalid token usage returned from Ollama"
+                    ) from None
 
             return LLMResponse(text=text, model=model_name, usage=usage)
 
+        except (InvalidRequestError, ProviderResponseError) as err:
+            raise self._sanitize_exception(err) from None
         except ProviderError as err:
-            raise self._sanitize_exception(err) from err
+            raise self._sanitize_exception(err) from None
         except Exception as err:
-            raise self._sanitize_exception(err) from err
+            raise self._sanitize_exception(err) from None

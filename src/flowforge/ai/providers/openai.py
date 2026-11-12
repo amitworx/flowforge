@@ -7,6 +7,7 @@ from typing import Any
 
 from flowforge.ai.providers.base import LLMProvider
 from flowforge.ai.providers.exceptions import (
+    InvalidRequestError,
     ProviderAuthenticationError,
     ProviderConfigError,
     ProviderError,
@@ -14,6 +15,7 @@ from flowforge.ai.providers.exceptions import (
 )
 from flowforge.ai.providers.transport import HTTPTransport
 from flowforge.ai.providers.types import (
+    MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
     LLMRequest,
     LLMResponse,
@@ -39,7 +41,12 @@ class OpenAICompatibleProvider(LLMProvider):
             raise ProviderAuthenticationError("api_key is required for OpenAICompatibleProvider")
 
         validated_url = validate_endpoint_url(base_url, allow_custom_host=True)
-        super().__init__(base_url=validated_url, api_key=api_key, transport=transport)
+        super().__init__(
+            base_url=validated_url,
+            api_key=api_key,
+            transport=transport,
+            allow_loopback=False,
+        )
 
     def generate(self, request: LLMRequest) -> LLMResponse:
         endpoint = f"{self.base_url}/chat/completions"
@@ -53,6 +60,11 @@ class OpenAICompatibleProvider(LLMProvider):
         }
 
         body_bytes = json.dumps(payload).encode("utf-8")
+        if len(body_bytes) > MAX_REQUEST_BYTES:
+            raise InvalidRequestError(
+                f"Request body size exceeds maximum allowed bytes ({len(body_bytes)} > {MAX_REQUEST_BYTES})"
+            )
+
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
@@ -72,7 +84,7 @@ class OpenAICompatibleProvider(LLMProvider):
                     f"Response size exceeds maximum allowed ({MAX_RESPONSE_BYTES} bytes)"
                 )
 
-            if status_code == 401 or status_code == 403:
+            if status_code in (401, 403):
                 raise ProviderAuthenticationError(
                     f"Authentication failed with provider status {status_code}"
                 )
@@ -82,8 +94,8 @@ class OpenAICompatibleProvider(LLMProvider):
 
             try:
                 data = json.loads(resp_bytes.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError) as err:
-                raise ProviderResponseError("Invalid JSON response from provider") from err
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise ProviderResponseError("Invalid JSON response from provider") from None
 
             if not isinstance(data, dict):
                 raise ProviderResponseError("Malformed response structure from provider")
@@ -101,20 +113,30 @@ class OpenAICompatibleProvider(LLMProvider):
                 raise ProviderResponseError("Missing content in choice message")
 
             text = msg_obj.get("content", "")
+            if not isinstance(text, str):
+                raise ProviderResponseError("Choice message content is not a string")
+
             model_name = data.get("model", request.model)
 
             usage: TokenUsage | None = None
             usage_obj = data.get("usage")
             if isinstance(usage_obj, dict):
-                usage = TokenUsage(
-                    prompt_tokens=usage_obj.get("prompt_tokens", 0),
-                    completion_tokens=usage_obj.get("completion_tokens", 0),
-                    total_tokens=usage_obj.get("total_tokens", 0),
-                )
+                try:
+                    usage = TokenUsage(
+                        prompt_tokens=usage_obj.get("prompt_tokens", 0),
+                        completion_tokens=usage_obj.get("completion_tokens", 0),
+                        total_tokens=usage_obj.get("total_tokens", 0),
+                    )
+                except Exception:
+                    raise ProviderResponseError(
+                        "Invalid token usage returned from provider"
+                    ) from None
 
             return LLMResponse(text=text, model=model_name, usage=usage)
 
+        except (InvalidRequestError, ProviderAuthenticationError, ProviderResponseError) as err:
+            raise self._sanitize_exception(err) from None
         except ProviderError as err:
-            raise self._sanitize_exception(err) from err
+            raise self._sanitize_exception(err) from None
         except Exception as err:
-            raise self._sanitize_exception(err) from err
+            raise self._sanitize_exception(err) from None

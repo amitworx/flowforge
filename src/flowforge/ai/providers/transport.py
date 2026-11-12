@@ -1,9 +1,13 @@
-"""Transport interface and minimal stdlib urllib-based implementation."""
+"""Transport interface and hardened stdlib urllib implementation."""
 
 from __future__ import annotations
 
 import io
+import ipaddress
+import re
+import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Protocol
 
@@ -13,6 +17,7 @@ from flowforge.ai.providers.exceptions import (
     ProviderTimeoutError,
 )
 from flowforge.ai.providers.types import MAX_RESPONSE_BYTES
+from flowforge.ai.providers.validation import is_ip_disallowed
 
 
 class HTTPTransport(Protocol):
@@ -44,11 +49,43 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         raise ProviderResponseError("Redirects are disallowed for security")
 
 
-class StdlibHTTPTransport:
-    """Deterministic, zero-dependency HTTP transport utilizing Python stdlib urllib."""
+def _validate_destination_ip(host: str, port: int, allow_loopback: bool = False) -> None:
+    """Resolve destination hostname and ensure resolved IP is permitted."""
+    clean_host = re.sub(r"^\[|\]$", "", host)
+    try:
+        resolved_addrs = socket.getaddrinfo(clean_host, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        raise ProviderConnectionError(f"DNS resolution failure for host '{host}'") from None
 
-    def __init__(self) -> None:
-        self.opener = urllib.request.build_opener(_NoRedirectHandler)
+    if not resolved_addrs:
+        raise ProviderConnectionError(f"No IP addresses resolved for host '{host}'")
+
+    for _family, _, _, _, sockaddr in resolved_addrs:
+        ip_str = sockaddr[0]
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+
+        if allow_loopback and ip_obj.is_loopback:
+            continue
+
+        if is_ip_disallowed(ip_obj):
+            raise ProviderConnectionError(
+                f"Resolved destination IP {ip_str} is not permitted for network connection"
+            )
+
+
+class StdlibHTTPTransport:
+    """Deterministic, zero-dependency, SSRF-hardened HTTP transport utilizing Python stdlib urllib."""
+
+    def __init__(self, *, allow_loopback: bool = False) -> None:
+        self.allow_loopback = allow_loopback
+        # Explicit ProxyHandler({}) ignores environment proxies (http_proxy/https_proxy) to prevent proxy bypasses
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _NoRedirectHandler(),
+        )
 
     def request(
         self,
@@ -59,6 +96,13 @@ class StdlibHTTPTransport:
         body: bytes | None = None,
         timeout: float = 30.0,
     ) -> tuple[int, bytes]:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+        # Enforce destination validation at connection time (DNS resolved IPs)
+        _validate_destination_ip(host, port, allow_loopback=self.allow_loopback)
+
         req_headers = headers.copy() if headers else {}
         req = urllib.request.Request(
             url=url,
@@ -95,14 +139,14 @@ class StdlibHTTPTransport:
             if "timed out" in reason.lower():
                 raise ProviderTimeoutError(
                     f"HTTP request timed out after {timeout} seconds"
-                ) from err
-            raise ProviderConnectionError(f"HTTP connection error: {reason}") from err
+                ) from None
+            raise ProviderConnectionError("HTTP connection failed") from None
 
-        except TimeoutError as err:
-            raise ProviderTimeoutError(f"HTTP request timed out after {timeout} seconds") from err
+        except TimeoutError:
+            raise ProviderTimeoutError(f"HTTP request timed out after {timeout} seconds") from None
 
         except ProviderResponseError:
             raise
 
-        except Exception as err:
-            raise ProviderResponseError(f"HTTP request failed: {err}") from err
+        except Exception:
+            raise ProviderResponseError("HTTP request failed") from None
