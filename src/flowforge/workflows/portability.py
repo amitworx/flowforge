@@ -1,8 +1,12 @@
-"""Constants, serializer, and bounded helpers for portable workflow definitions (M0-011)."""
+"""Constants, serializer, parser, and bounded helpers for portable workflow definitions (M0-011 / M0-011A)."""
 
+import json
+import math
 from typing import Any
 
 from rest_framework import serializers
+from rest_framework.exceptions import ParseError
+from rest_framework.parsers import BaseParser
 
 from flowforge.workflows.engine import WorkflowExecutionError, validate_step_definitions
 from flowforge.workflows.export import serialize_to_bounded_json
@@ -13,6 +17,107 @@ WORKFLOW_INTERCHANGE_FORMAT = "flowforge.workflow"
 WORKFLOW_INTERCHANGE_VERSION = 1
 
 
+class BoundedPayloadTooLargeError(Exception):
+    """Raised when an incoming request stream exceeds MAX_WORKFLOW_PORTABILITY_SIZE_BYTES."""
+
+    def __init__(
+        self,
+        message: str = f"Import payload exceeds maximum allowed size of {MAX_WORKFLOW_PORTABILITY_SIZE_BYTES} bytes.",
+    ):
+        super().__init__(message)
+        self.message = message
+
+
+def _reject_non_finite_float_constants(val: str) -> None:
+    """Callback for json.loads parse_constant to disallow NaN, Infinity, -Infinity."""
+    raise ValueError(f"Non-standard JSON constant not allowed: '{val}'")
+
+
+def _validate_finite_numbers_in_steps(steps: list[dict[str, Any]]) -> None:
+    """Ensure all floats in step definitions are finite numbers (no NaN or Infinity)."""
+    for idx, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        val = step.get("value")
+        if isinstance(val, float) and not math.isfinite(val):
+            raise WorkflowExecutionError(
+                f"Step {idx} ({step.get('op', 'unknown')}): Non-finite float value '{val}' is not permitted."
+            )
+
+
+def read_bounded_request_stream(
+    stream: Any, max_bytes: int = MAX_WORKFLOW_PORTABILITY_SIZE_BYTES
+) -> bytes:
+    """
+    Reads at most (max_bytes + 1) bytes from an incoming stream in bounded chunks.
+    Raises BoundedPayloadTooLargeError as soon as accumulated bytes exceed max_bytes.
+    This guarantees that unparsed payload data never consumes unbounded memory.
+    Handles Django test FakePayload len semantics gracefully.
+    """
+    accumulated = bytearray()
+    chunk_size = min(max_bytes + 1, 8192)
+
+    while True:
+        # Calculate target read size for this step
+        remaining_to_max = (max_bytes + 1) - len(accumulated)
+        to_read = min(chunk_size, remaining_to_max)
+
+        # In Django test Client FakePayload, stream.read(size) asserts len(stream) >= size
+        if hasattr(stream, "__len__") and not isinstance(stream, (bytes, bytearray)):
+            try:
+                available = len(stream)
+                if available == 0:
+                    break
+                to_read = min(to_read, available)
+            except (TypeError, Exception):
+                pass
+
+        chunk = stream.read(to_read)
+        if not chunk:
+            break
+        accumulated.extend(chunk)
+        if len(accumulated) > max_bytes:
+            raise BoundedPayloadTooLargeError(
+                f"Import payload exceeds maximum allowed size of {max_bytes} bytes."
+            )
+
+    return bytes(accumulated)
+
+
+class BoundedJSONParser(BaseParser):
+    """
+    DRF Parser for application/json that enforces strict byte length constraints
+    at the stream level before parsing JSON into memory, rejecting oversized payloads
+    and non-standard JSON literals (NaN, Infinity).
+    """
+
+    media_type = "application/json"
+
+    def parse(self, stream, media_type=None, parser_context=None):  # noqa: ARG002
+        # Determine the underlying raw stream if wrapped in Django's WSGIRequest or LimitedStream
+        raw_stream = stream
+        if parser_context and "request" in parser_context:
+            req = parser_context["request"]
+            # Look up raw WSGI input stream from environ to defend against inaccurate-small Content-Length
+            wsgi_input = getattr(req, "environ", {}).get("wsgi.input")
+            if wsgi_input is not None and hasattr(wsgi_input, "read"):
+                raw_stream = wsgi_input
+
+        raw_bytes = read_bounded_request_stream(raw_stream, MAX_WORKFLOW_PORTABILITY_SIZE_BYTES)
+        if not raw_bytes:
+            raise ParseError("Request body cannot be empty.")
+
+        try:
+            text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ParseError("Invalid payload encoding. Expected valid UTF-8 JSON.") from exc
+
+        try:
+            return json.loads(text, parse_constant=_reject_non_finite_float_constants)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ParseError(f"Malformed JSON payload: {exc}.") from exc
+
+
 def serialize_workflow_definition_export(
     name: str,
     steps: list[dict[str, Any]],
@@ -20,10 +125,11 @@ def serialize_workflow_definition_export(
 ) -> bytes:
     """
     Serializes a workflow definition into the deterministic v1 interchange JSON envelope.
-    Verifies step validity and encodes with an incremental UTF-8 byte boundary.
+    Verifies step validity, rejects non-finite floats, and encodes with an incremental UTF-8 byte boundary.
     """
     # Defensive step validation before serialization
     validate_step_definitions(steps)
+    _validate_finite_numbers_in_steps(steps)
 
     envelope = {
         "format": WORKFLOW_INTERCHANGE_FORMAT,
@@ -94,6 +200,8 @@ class WorkflowImportSerializer(serializers.Serializer):
 
     def validate_steps(self, value):
         try:
-            return validate_step_definitions(value)
+            validated = validate_step_definitions(value)
+            _validate_finite_numbers_in_steps(validated)
+            return validated
         except WorkflowExecutionError as exc:
             raise serializers.ValidationError(exc.message) from exc

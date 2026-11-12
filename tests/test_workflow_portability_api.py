@@ -415,3 +415,152 @@ class TestWorkflowPortabilitySizeLimits:
             content_type="application/json",
         )
         assert response.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+
+    def test_import_inaccurate_small_content_length_bounded_stream_rejected_with_413(
+        self, auth_client
+    ):
+        # Header claims 10 bytes, but body sends 70,000 bytes.
+        # Bounded stream reader must read max 65537 bytes and return 413, not crash or accept.
+        oversized_data = b" " * 70000
+        response = auth_client.generic(
+            "POST",
+            "/api/v1/workflows/import/",
+            data=oversized_data,
+            content_type="application/json",
+            CONTENT_LENGTH="10",
+        )
+        assert response.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+
+    def test_import_unicode_multibyte_exact_byte_boundary(self, auth_client):
+        # Multi-byte UTF-8 characters (e.g. 3-byte '€' or 4-byte '🚀')
+        # Ensure exact byte measurement matches 65536 vs 65537
+        base_payload = {
+            "format": "flowforge.workflow",
+            "format_version": 1,
+            "name": "Unicode Boundary",
+            "steps": [{"op": "select_columns", "columns": ["id"]}],
+        }
+        step_template = {
+            "op": "filter_equals",
+            "column": "col",
+            "value": "€",  # 3 bytes in UTF-8
+        }
+        base_payload["steps"].append(step_template)
+        base_bytes = json.dumps(base_payload).encode("utf-8")
+        pad_len = 65536 - len(base_bytes)
+        # Pad with 1-byte ASCII characters 'A'
+        base_payload["steps"][1]["value"] = "€" + ("A" * pad_len)
+        exact_bytes = json.dumps(base_payload).encode("utf-8")
+        assert len(exact_bytes) == 65536
+
+        res_ok = auth_client.post(
+            "/api/v1/workflows/import/", exact_bytes, content_type="application/json"
+        )
+        assert res_ok.status_code == status.HTTP_201_CREATED
+
+        # Add 1 byte to make it 65537
+        over_bytes = exact_bytes + b" "
+        assert len(over_bytes) == 65537
+        res_over = auth_client.post(
+            "/api/v1/workflows/import/", over_bytes, content_type="application/json"
+        )
+        assert res_over.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+
+    def test_import_rejects_unsupported_content_type(self, auth_client):
+        response = auth_client.generic(
+            "POST",
+            "/api/v1/workflows/import/",
+            data=b"not json",
+            content_type="text/plain",
+        )
+        assert response.status_code == status.HTTP_415_UNSUPPORTED_MEDIA_TYPE
+
+    def test_import_rejects_nan_and_infinity_literals(self, auth_client):
+        # Test NaN in filter_equals value
+        payload_nan = (
+            b'{"format": "flowforge.workflow", "format_version": 1, "name": "NaN Test", '
+            b'"steps": [{"op": "filter_equals", "column": "num", "value": NaN}]}'
+        )
+        res_nan = auth_client.post(
+            "/api/v1/workflows/import/", payload_nan, content_type="application/json"
+        )
+        assert res_nan.status_code == status.HTTP_400_BAD_REQUEST
+        assert "Non-standard JSON constant not allowed" in str(res_nan.data) or "Malformed" in str(
+            res_nan.data
+        )
+
+        # Test Infinity in filter_equals value
+        payload_inf = (
+            b'{"format": "flowforge.workflow", "format_version": 1, "name": "Inf Test", '
+            b'"steps": [{"op": "filter_equals", "column": "num", "value": Infinity}]}'
+        )
+        res_inf = auth_client.post(
+            "/api/v1/workflows/import/", payload_inf, content_type="application/json"
+        )
+        assert res_inf.status_code == status.HTTP_400_BAD_REQUEST
+
+        # Test -Infinity in filter_equals value
+        payload_ninf = (
+            b'{"format": "flowforge.workflow", "format_version": 1, "name": "-Inf Test", '
+            b'"steps": [{"op": "filter_equals", "column": "num", "value": -Infinity}]}'
+        )
+        res_ninf = auth_client.post(
+            "/api/v1/workflows/import/", payload_ninf, content_type="application/json"
+        )
+        assert res_ninf.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_import_and_export_preserve_valid_finite_floats_and_numbers(self, auth_client):
+        # Valid numbers: 0, 42, -15, 3.14159, 1e-5, leading-zero strings "007"
+        payload = {
+            "format": "flowforge.workflow",
+            "format_version": 1,
+            "name": "Numbers Test",
+            "steps": [
+                {"op": "select_columns", "columns": ["id", "val"]},
+                {"op": "filter_equals", "column": "val", "value": 3.14159},
+            ],
+        }
+        res_imp = auth_client.post(
+            "/api/v1/workflows/import/", json.dumps(payload), content_type="application/json"
+        )
+        assert res_imp.status_code == status.HTTP_201_CREATED
+        created_id = res_imp.data["id"]
+        assert res_imp.data["steps"][1]["value"] == 3.14159
+
+        # Export and verify the float is preserved
+        res_exp = auth_client.get(f"/api/v1/workflows/{created_id}/export/")
+        assert res_exp.status_code == status.HTTP_200_OK
+        exp_data = res_exp.json()
+        assert exp_data["steps"][1]["value"] == 3.14159
+
+    def test_export_corrupt_legacy_non_finite_float_fails_with_400(self, auth_client, monkeypatch):
+        # Create a valid workflow first, then simulate legacy in-memory non-finite float
+        valid_wf = WorkflowDefinition.objects.create(
+            owner=auth_client.user,
+            name="Legacy NaN WF",
+            steps=[
+                {"op": "select_columns", "columns": ["id"]},
+                {"op": "filter_equals", "column": "score", "value": 1.0},
+            ],
+        )
+
+        orig_select = WorkflowDefinition.objects.select_for_update
+
+        def mock_select(*args, **kwargs):
+            qs = orig_select(*args, **kwargs)
+            orig_get = qs.get
+
+            def mock_get(*g_args, **g_kwargs):
+                wf = orig_get(*g_args, **g_kwargs)
+                # Inject legacy NaN in memory after loading
+                wf.steps[1]["value"] = float("nan")
+                return wf
+
+            qs.get = mock_get
+            return qs
+
+        monkeypatch.setattr(WorkflowDefinition.objects, "select_for_update", mock_select)
+
+        res = auth_client.get(f"/api/v1/workflows/{valid_wf.id}/export/")
+        assert res.status_code == status.HTTP_400_BAD_REQUEST
+        assert "finite" in str(res.data).lower() or "corrupt" in str(res.data).lower()

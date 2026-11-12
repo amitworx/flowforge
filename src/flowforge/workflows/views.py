@@ -1,5 +1,4 @@
 import copy
-import json
 import logging
 
 from django.db import transaction
@@ -10,7 +9,6 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.exceptions import NotFound
 from rest_framework.negotiation import BaseContentNegotiation
-from rest_framework.parsers import BaseParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -34,6 +32,8 @@ from flowforge.workflows.export import (
 from flowforge.workflows.models import WorkflowDefinition, WorkflowRun
 from flowforge.workflows.portability import (
     MAX_WORKFLOW_PORTABILITY_SIZE_BYTES,
+    BoundedJSONParser,
+    BoundedPayloadTooLargeError,
     WorkflowImportSerializer,
     serialize_workflow_definition_export,
 )
@@ -736,18 +736,6 @@ class WorkflowCloneView(APIView):
         )
 
 
-class RawBoundedJsonParser(BaseParser):
-    """
-    Parser for application/json that enforces strict payload length constraints
-    before parsing JSON into memory, protecting against Denial-of-Service.
-    """
-
-    media_type = "application/json"
-
-    def parse(self, stream, media_type=None, parser_context=None):  # noqa: ARG002
-        return stream
-
-
 class WorkflowExportView(APIView):
     """
     GET /api/v1/workflows/{uuid}/export/
@@ -807,14 +795,22 @@ class WorkflowImportView(APIView):
     """
     POST /api/v1/workflows/import/
     Imports a versioned JSON interchange envelope and creates a new active workflow definition.
-    Enforces a strict 64 KiB request size limit before parsing.
+    Enforces a strict 64 KiB request size limit at the stream level before parsing.
+
+    Transport semantics & security boundaries:
+    - Bounded stream parsing: `BoundedJSONParser` consumes at most (MAX_BYTES + 1) bytes
+      from the request stream, raising an early 413 error if exceeded.
+    - WSGI/ASGI buffering: WSGI servers (e.g. gunicorn) or reverse proxies (e.g. nginx)
+      may buffer request bodies at the socket layer prior to handing them to the WSGI worker.
+      The bounded stream reader defends application process memory against unbounded JSON
+      deserialization and processing DoS.
     """
 
     permission_classes = [IsAuthenticated]
-    parser_classes = [RawBoundedJsonParser]
+    parser_classes = [BoundedJSONParser]
 
     def post(self, request: Request) -> Response:
-        # 1. Content-Length header early check
+        # 1. Content-Length early optimization check (never relied upon exclusively)
         content_length = request.META.get("CONTENT_LENGTH")
         if content_length:
             try:
@@ -828,40 +824,15 @@ class WorkflowImportView(APIView):
             except (ValueError, TypeError):
                 pass
 
-        # 2. Read body with bounded size check
+        # 2. Access parsed data from BoundedJSONParser (which performs bounded stream reading)
         try:
-            raw_body = request._request.body
-        except Exception:
-            raw_body = b""
-
-        if len(raw_body) > MAX_WORKFLOW_PORTABILITY_SIZE_BYTES:
+            parsed_data = request.data
+        except BoundedPayloadTooLargeError:
             return Response(
                 {
                     "detail": f"Import payload exceeds maximum allowed size of {MAX_WORKFLOW_PORTABILITY_SIZE_BYTES} bytes."
                 },
                 status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            )
-
-        if not raw_body:
-            return Response(
-                {"detail": "Request body cannot be empty."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        try:
-            text_body = raw_body.decode("utf-8")
-        except UnicodeDecodeError:
-            return Response(
-                {"detail": "Invalid payload encoding. Expected valid UTF-8 JSON."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        try:
-            parsed_data = json.loads(text_body)
-        except json.JSONDecodeError as exc:
-            return Response(
-                {"detail": f"Malformed JSON payload: {exc.msg}."},
-                status=status.HTTP_400_BAD_REQUEST,
             )
 
         serializer = WorkflowImportSerializer(data=parsed_data)
