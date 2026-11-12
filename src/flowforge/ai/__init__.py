@@ -1,1 +1,1 @@
-"""FlowForge AI package."""
+"""FlowForge AI subsystem package."""
