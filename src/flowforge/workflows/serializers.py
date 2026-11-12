@@ -1,5 +1,6 @@
 from rest_framework import serializers
 
+from flowforge.core.datetime_utils import parse_iso_aware_datetime
 from flowforge.workflows.engine import WorkflowExecutionError, validate_step_definitions
 from flowforge.workflows.models import WorkflowDefinition, WorkflowRun, WorkflowStepRun
 
@@ -240,34 +241,13 @@ class WorkflowRunFilterSerializer(serializers.Serializer):
                 )
             )
 
-        from django.utils import timezone
-        from django.utils.dateparse import parse_datetime
-
-        def _parse_iso_aware(val: str, field_name: str):
-            val_clean = val.strip()
-            # Standard URL query decoding converts unencoded '+' into a space (' ')
-            # Restore '+' if the part after space looks like a timezone offset
-            if " " in val_clean and ("+" not in val_clean and not val_clean.endswith("Z")):
-                parts = val_clean.split(" ")
-                if len(parts) == 2 and (":" in parts[1] or len(parts[1]) == 4):
-                    val_clean = f"{parts[0]}+{parts[1]}"
-
-            dt = parse_datetime(val_clean)
-            if dt is None:
-                raise serializers.ValidationError({field_name: "Invalid ISO 8601 datetime format."})
-            if not timezone.is_aware(dt):
-                raise serializers.ValidationError(
-                    {field_name: "Datetime must be timezone-aware (e.g. UTC 'Z' or offset)."}
-                )
-            return dt
-
         created_from_str = attrs.get("created_from")
         if created_from_str:
-            attrs["created_from_dt"] = _parse_iso_aware(created_from_str, "created_from")
+            attrs["created_from_dt"] = parse_iso_aware_datetime(created_from_str, "created_from")
 
         created_to_str = attrs.get("created_to")
         if created_to_str:
-            attrs["created_to_dt"] = _parse_iso_aware(created_to_str, "created_to")
+            attrs["created_to_dt"] = parse_iso_aware_datetime(created_to_str, "created_to")
 
         if (
             "created_from_dt" in attrs
@@ -304,32 +284,13 @@ class WorkflowRunSummaryFilterSerializer(serializers.Serializer):
                 )
             )
 
-        from django.utils import timezone
-        from django.utils.dateparse import parse_datetime
-
-        def _parse_iso_aware(val: str, field_name: str):
-            val_clean = val.strip()
-            if " " in val_clean and ("+" not in val_clean and not val_clean.endswith("Z")):
-                parts = val_clean.split(" ")
-                if len(parts) == 2 and (":" in parts[1] or len(parts[1]) == 4):
-                    val_clean = f"{parts[0]}+{parts[1]}"
-
-            dt = parse_datetime(val_clean)
-            if dt is None:
-                raise serializers.ValidationError({field_name: "Invalid ISO 8601 datetime format."})
-            if not timezone.is_aware(dt):
-                raise serializers.ValidationError(
-                    {field_name: "Datetime must be timezone-aware (e.g. UTC 'Z' or offset)."}
-                )
-            return dt
-
         created_from_str = attrs.get("created_from")
         if created_from_str:
-            attrs["created_from_dt"] = _parse_iso_aware(created_from_str, "created_from")
+            attrs["created_from_dt"] = parse_iso_aware_datetime(created_from_str, "created_from")
 
         created_to_str = attrs.get("created_to")
         if created_to_str:
-            attrs["created_to_dt"] = _parse_iso_aware(created_to_str, "created_to")
+            attrs["created_to_dt"] = parse_iso_aware_datetime(created_to_str, "created_to")
 
         if (
             "created_from_dt" in attrs

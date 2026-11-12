@@ -142,8 +142,21 @@ curl -u devuser:devpass123 \
 #### 3. List Ingestion Jobs
 ```bash
 curl -u devuser:devpass123 \
-  http://127.0.0.1:8001/api/v1/jobs/
+  "http://127.0.0.1:8001/api/v1/jobs/?file_type=csv&state=completed&ordering=-created_at&page=1&page_size=20"
 ```
+
+**Query Parameters:**
+- `file_type` *(optional)*: Filter by file format (`csv` or `json`).
+- `state` *(optional)*: Filter by job state (`pending`, `processing`, `completed`, or `failed`).
+- `created_from` *(optional)*: ISO-8601 timezone-aware start datetime (inclusive, e.g. `2026-11-12T10:00:00Z`).
+- `created_to` *(optional)*: ISO-8601 timezone-aware end datetime (inclusive, e.g. `2026-11-12T18:00:00Z`). Must be greater than or equal to `created_from`.
+- `ordering` *(optional)*: Sort order (`-created_at` for newest-first [default], or `created_at` for oldest-first). Both use `id` as a secondary tie-breaker to ensure deterministic pagination.
+- `page` *(optional)*: Positive integer page number (default: 1).
+- `page_size` *(optional)*: Number of results per page (integer between 1 and 100, default: 20).
+
+*Validation Note:* Unknown query parameters, duplicate parameter keys, naive datetimes, invalid enums, or out-of-range pagination values immediately return HTTP `400 Bad Request`. Large job output payloads are excluded (`output_data` deferred) in the list endpoint to protect database and network query costs.
+
+*Pagination Note:* Offset-based pagination may skip or duplicate records if concurrent insertions occur during iteration; for consistent snapshots, bound the query using `created_to`.
 
 #### 4. Download Normalized Output
 ```bash
