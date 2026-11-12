@@ -3,13 +3,13 @@
 import re
 from typing import Any
 
-# Match standard API keys (e.g. OpenAI sk-..., sk-proj-..., anthropic sk-ant-..., generic api keys)
+# Match standard API keys (e.g. OpenAI sk-..., sk-proj-..., anthropic sk-ant-..., generic api keys, github tokens)
 _API_KEY_REGEX = re.compile(
     r"\b(sk-[a-zA-Z0-9_-]{16,}|sk-proj-[a-zA-Z0-9_-]{16,}|sk-ant-[a-zA-Z0-9_-]{16,}|ghp_[a-zA-Z0-9]{36}|gho_[a-zA-Z0-9]{36})\b",
     re.IGNORECASE,
 )
 
-# Match Authorization headers
+# Match Authorization headers and Bearer tokens
 _AUTH_HEADER_REGEX = re.compile(
     r"(Bearer\s+)[a-zA-Z0-9\._\-]+",
     re.IGNORECASE,
@@ -38,7 +38,12 @@ _SENSITIVE_KEYS = {
 
 
 def redact_secrets_from_text(text: str) -> str:
-    """Deterministically redact API keys, Bearer tokens, and URL credentials from text."""
+    """Deterministically redact API keys, Bearer tokens, and URL credentials from text.
+
+    Note:
+        Heuristic redaction cannot guarantee discovery of all arbitrary or custom secret shapes.
+        Caller code should never deliberately embed raw credentials in messages.
+    """
     if not isinstance(text, str):
         return text
 

@@ -1,8 +1,23 @@
 """Typed safety bounds and validation for AI inputs and outputs."""
 
+import math
 from dataclasses import dataclass
 
-from src.flowforge.ai.safety.exceptions import AIConfigurationError, AIPolicyLimitError
+from flowforge.ai.safety.exceptions import AIConfigurationError, AIPolicyLimitError
+
+
+def _validate_positive_int(val: int, name: str) -> None:
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise AIConfigurationError(f"{name} must be an integer, not bool")
+    if val <= 0:
+        raise AIConfigurationError(f"{name} must be a strictly positive integer")
+
+
+def _validate_positive_float(val: float, name: str) -> None:
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise AIConfigurationError(f"{name} must be a real number, not bool")
+    if math.isnan(val) or math.isinf(val) or val <= 0.0:
+        raise AIConfigurationError(f"{name} must be a strictly positive finite float")
 
 
 @dataclass(frozen=True)
@@ -17,18 +32,12 @@ class SafetyLimits:
     timeout_seconds: float = 60.0
 
     def __post_init__(self) -> None:
-        if self.max_prompt_chars <= 0:
-            raise AIConfigurationError("max_prompt_chars must be a strictly positive integer")
-        if self.max_prompt_bytes <= 0:
-            raise AIConfigurationError("max_prompt_bytes must be a strictly positive integer")
-        if self.max_response_bytes <= 0:
-            raise AIConfigurationError("max_response_bytes must be a strictly positive integer")
-        if self.max_output_tokens <= 0:
-            raise AIConfigurationError("max_output_tokens must be a strictly positive integer")
-        if self.max_workflow_ai_calls <= 0:
-            raise AIConfigurationError("max_workflow_ai_calls must be a strictly positive integer")
-        if self.timeout_seconds <= 0.0:
-            raise AIConfigurationError("timeout_seconds must be a strictly positive finite float")
+        _validate_positive_int(self.max_prompt_chars, "max_prompt_chars")
+        _validate_positive_int(self.max_prompt_bytes, "max_prompt_bytes")
+        _validate_positive_int(self.max_response_bytes, "max_response_bytes")
+        _validate_positive_int(self.max_output_tokens, "max_output_tokens")
+        _validate_positive_int(self.max_workflow_ai_calls, "max_workflow_ai_calls")
+        _validate_positive_float(self.timeout_seconds, "timeout_seconds")
 
 
 def validate_prompt_input(prompt: str, limits: SafetyLimits) -> None:
@@ -66,6 +75,17 @@ def validate_response_output(
         raise AIPolicyLimitError(
             "Response must be bytes",
             limit_name="max_response_bytes",
+        )
+
+    if isinstance(output_tokens, bool):
+        raise AIPolicyLimitError(
+            "Output tokens must be an integer, not bool",
+            limit_name="max_output_tokens",
+        )
+    if not isinstance(output_tokens, int) or output_tokens < 0:
+        raise AIPolicyLimitError(
+            "Output tokens must be a non-negative integer",
+            limit_name="max_output_tokens",
         )
 
     byte_len = len(response_bytes)
