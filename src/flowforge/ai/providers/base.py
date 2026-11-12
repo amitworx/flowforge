@@ -6,7 +6,7 @@ import re
 from abc import ABC, abstractmethod
 
 from flowforge.ai.providers.exceptions import ProviderError
-from flowforge.ai.providers.transport import HTTPTransport, RequestsHTTPTransport
+from flowforge.ai.providers.transport import HTTPTransport, StdlibHTTPTransport
 from flowforge.ai.providers.types import LLMRequest, LLMResponse
 
 
@@ -35,7 +35,7 @@ class LLMProvider(ABC):
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-        self.transport = transport or RequestsHTTPTransport()
+        self.transport = transport or StdlibHTTPTransport()
 
     @abstractmethod
     def generate(self, request: LLMRequest) -> LLMResponse:

@@ -14,7 +14,7 @@ from flowforge.ai.providers.exceptions import (
 )
 from flowforge.ai.providers.ollama import OllamaProvider
 from flowforge.ai.providers.openai import OpenAICompatibleProvider
-from flowforge.ai.providers.transport import HTTPTransport, RequestsHTTPTransport
+from flowforge.ai.providers.transport import HTTPTransport, StdlibHTTPTransport
 from flowforge.ai.providers.types import (
     MAX_MESSAGES_COUNT,
     MAX_RESPONSE_BYTES,
@@ -46,7 +46,7 @@ __all__ = [
     "ProviderError",
     "ProviderResponseError",
     "ProviderTimeoutError",
-    "RequestsHTTPTransport",
+    "StdlibHTTPTransport",
     "TokenUsage",
     "sanitize_error_message",
     "validate_endpoint_url",
