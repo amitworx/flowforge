@@ -48,6 +48,19 @@ class RetryPolicy:
         if self.max_interval_seconds < self.initial_interval_seconds:
             raise AIConfigurationError("max_interval_seconds must be >= initial_interval_seconds")
 
+        if not isinstance(self.retryable_status_codes, (tuple, list)):
+            raise AIConfigurationError("retryable_status_codes must be a tuple or list of integers")
+
+        for code in self.retryable_status_codes:
+            if isinstance(code, bool) or not isinstance(code, int):
+                raise AIConfigurationError(
+                    "status code in retryable_status_codes must be an integer, not bool"
+                )
+            if code < 100 or code > 599:
+                raise AIConfigurationError(
+                    "status code in retryable_status_codes must be between 100 and 599"
+                )
+
 
 @dataclass(frozen=True)
 class RetryDecision:
@@ -82,6 +95,9 @@ def evaluate_retry(
     if attempt < 1:
         raise AIConfigurationError("attempt must be >= 1")
 
+    if not isinstance(is_idempotent, bool):
+        raise AIConfigurationError("is_idempotent must be a boolean")
+
     if isinstance(pseudo_seed, bool) or not isinstance(pseudo_seed, (int, float)):
         raise AIConfigurationError("pseudo_seed must be a finite float, not bool")
     if math.isnan(pseudo_seed) or math.isinf(pseudo_seed):
@@ -108,10 +124,24 @@ def evaluate_retry(
             reason=f"Non-retryable status code: {status_code}",
         )
 
-    # Calculate bounded exponential backoff
-    # Base delay = initial * (multiplier ^ (attempt - 1))
+    # Calculate bounded exponential backoff safely without overflow
     exponent = max(0, attempt - 1)
-    base_delay = policy.initial_interval_seconds * (policy.backoff_multiplier**exponent)
+    if policy.backoff_multiplier == 1.0 or exponent == 0:
+        base_delay = policy.initial_interval_seconds
+    else:
+        # Check if exponent would exceed log2 threshold to avoid OverflowError
+        max_ratio = policy.max_interval_seconds / policy.initial_interval_seconds
+        try:
+            # If exponent * log(multiplier) >= log(max_ratio), it reaches max_interval_seconds
+            log_mult = math.log(policy.backoff_multiplier)
+            log_ratio = math.log(max_ratio) if max_ratio > 0 else 0.0
+            if exponent * log_mult >= log_ratio:
+                base_delay = policy.max_interval_seconds
+            else:
+                base_delay = policy.initial_interval_seconds * (policy.backoff_multiplier**exponent)
+        except (OverflowError, ValueError):
+            base_delay = policy.max_interval_seconds
+
     bounded_delay = min(base_delay, policy.max_interval_seconds)
 
     # Apply deterministic jitter: jitter factor in [0, 1) scaled to 0.5 * bounded_delay

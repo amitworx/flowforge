@@ -6,32 +6,34 @@ from typing import Any
 class AISafetyError(Exception):
     """Base exception for all AI safety errors.
 
-    String representation and representation methods are safe by default and
-    automatically redact credentials and sensitive tokens.
+    Sanitizes message, args, and details at construction time so that
+    inspectors, serializers, logging frameworks, and __str__/__repr__
+    never access unredacted secrets.
     """
 
     def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
-        super().__init__(message)
-        self.message = str(message)
-        self.details = details or {}
+        from flowforge.ai.safety.redaction import redact_secrets_from_dict, redact_secrets_from_text
+
+        sanitized_msg = redact_secrets_from_text(str(message))
+        sanitized_det = redact_secrets_from_dict(details or {})
+
+        super().__init__(sanitized_msg)
+        self.message = sanitized_msg
+        self.details = sanitized_det
 
     def __str__(self) -> str:
-        return self.sanitized_message()
+        return self.message
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}({self.sanitized_message()!r})"
+        return f"{self.__class__.__name__}({self.message!r})"
 
     def sanitized_message(self) -> str:
-        """Return a message guaranteed not to leak secret tokens or API keys."""
-        from flowforge.ai.safety.redaction import redact_secrets_from_text
-
-        return redact_secrets_from_text(self.message)
+        """Return the sanitized message string."""
+        return self.message
 
     def sanitized_details(self) -> dict[str, Any]:
         """Return details dictionary with sensitive keys and values redacted."""
-        from flowforge.ai.safety.redaction import redact_secrets_from_dict
-
-        return redact_secrets_from_dict(self.details)
+        return self.details
 
 
 class AIConfigurationError(AISafetyError):
