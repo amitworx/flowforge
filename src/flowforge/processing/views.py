@@ -14,6 +14,7 @@ from rest_framework.views import APIView
 from flowforge.processing.models import ProcessingJob
 from flowforge.processing.serializers import (
     ProcessingJobDetailSerializer,
+    ProcessingJobFilterSerializer,
     ProcessingJobListSerializer,
 )
 from flowforge.processing.services import (
@@ -90,7 +91,37 @@ class ProcessingJobListCreateView(APIView):
         return super().initial(request, *args, **kwargs)
 
     def get(self, request: Request) -> Response:
-        queryset = ProcessingJob.objects.filter(owner=request.user)
+        # Check for duplicate query parameters
+        if any(len(values) > 1 for _, values in request.GET.lists()):
+            return Response(
+                {"detail": "Duplicate query parameters are not permitted."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        filter_serializer = ProcessingJobFilterSerializer(data=request.query_params)
+        filter_serializer.is_valid(raise_exception=True)
+        validated = filter_serializer.validated_data
+
+        queryset = ProcessingJob.objects.filter(owner=request.user).defer("output_data")
+
+        if "file_type" in validated:
+            queryset = queryset.filter(file_type=validated["file_type"])
+
+        if "state" in validated:
+            queryset = queryset.filter(state=validated["state"])
+
+        if "created_from_dt" in validated:
+            queryset = queryset.filter(created_at__gte=validated["created_from_dt"])
+
+        if "created_to_dt" in validated:
+            queryset = queryset.filter(created_at__lte=validated["created_to_dt"])
+
+        ordering_param = validated.get("ordering", "-created_at")
+        if ordering_param == "created_at":
+            queryset = queryset.order_by("created_at", "id")
+        else:
+            queryset = queryset.order_by("-created_at", "-id")
+
         paginator = JobPagination()
         page = paginator.paginate_queryset(queryset, request, view=self)
         serializer = ProcessingJobListSerializer(page, many=True, context={"request": request})
