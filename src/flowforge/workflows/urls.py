@@ -7,6 +7,8 @@ from flowforge.workflows.views import (
     WorkflowDefinitionListCreateView,
     WorkflowExecuteAsyncRunView,
     WorkflowExecuteRunView,
+    WorkflowExportView,
+    WorkflowImportView,
     WorkflowPreviewView,
     WorkflowRestoreView,
     WorkflowRunDetailView,
@@ -17,7 +19,13 @@ from flowforge.workflows.views import (
 
 urlpatterns = [
     path("workflows/", WorkflowDefinitionListCreateView.as_view(), name="workflow-list-create"),
+    path("workflows/import/", WorkflowImportView.as_view(), name="workflow-import"),
     path("workflows/<uuid:uuid>/", WorkflowDefinitionDetailView.as_view(), name="workflow-detail"),
+    path(
+        "workflows/<uuid:uuid>/export/",
+        WorkflowExportView.as_view(),
+        name="workflow-export",
+    ),
     path(
         "workflows/<uuid:uuid>/clone/",
         WorkflowCloneView.as_view(),

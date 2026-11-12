@@ -30,6 +30,13 @@ from flowforge.workflows.export import (
     serialize_to_bounded_json,
 )
 from flowforge.workflows.models import WorkflowDefinition, WorkflowRun
+from flowforge.workflows.portability import (
+    MAX_WORKFLOW_PORTABILITY_SIZE_BYTES,
+    BoundedJSONParser,
+    BoundedPayloadTooLargeError,
+    WorkflowImportSerializer,
+    serialize_workflow_definition_export,
+)
 from flowforge.workflows.serializers import (
     WorkflowAsyncRunResponseSerializer,
     WorkflowCloneRequestSerializer,
@@ -724,6 +731,138 @@ class WorkflowCloneView(APIView):
 
         response_data = WorkflowDefinitionSerializer(cloned_wf, context={"request": request}).data
         location = f"/api/v1/workflows/{cloned_wf.id}/"
+        return Response(
+            response_data, status=status.HTTP_201_CREATED, headers={"Location": location}
+        )
+
+
+class WorkflowExportView(APIView):
+    """
+    GET /api/v1/workflows/{uuid}/export/
+    Exports a workflow definition's name and steps into a versioned JSON interchange envelope.
+    Read-only, atomic snapshot under row lock, strictly memory-bounded.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request: Request, uuid) -> HttpResponse:
+        try:
+            with transaction.atomic():
+                try:
+                    wf = WorkflowDefinition.objects.select_for_update().get(
+                        id=uuid, owner=request.user
+                    )
+                except (WorkflowDefinition.DoesNotExist, ValueError):
+                    return Response(
+                        {"detail": "Workflow definition not found."},
+                        status=status.HTTP_404_NOT_FOUND,
+                    )
+
+                name_snapshot = wf.name
+                steps_snapshot = copy.deepcopy(wf.steps)
+        except Exception:
+            raise
+
+        try:
+            serialized_bytes = serialize_workflow_definition_export(
+                name=name_snapshot,
+                steps=steps_snapshot,
+                max_bytes=MAX_WORKFLOW_PORTABILITY_SIZE_BYTES,
+            )
+        except WorkflowExecutionError as exc:
+            return Response(
+                {"detail": f"Workflow definition steps are corrupt/invalid: {exc.message}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except ExportPayloadTooLargeError:
+            return Response(
+                {
+                    "detail": f"Export payload exceeds maximum size of {MAX_WORKFLOW_PORTABILITY_SIZE_BYTES} bytes."
+                },
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+
+        response = HttpResponse(
+            serialized_bytes,
+            status=status.HTTP_200_OK,
+            content_type="application/json; charset=utf-8",
+        )
+        response["Content-Disposition"] = f'attachment; filename="workflow-{uuid}.json"'
+        return response
+
+
+class WorkflowImportView(APIView):
+    """
+    POST /api/v1/workflows/import/
+    Imports a versioned JSON interchange envelope and creates a new active workflow definition.
+    Enforces a strict 64 KiB request size limit at the stream level before parsing.
+
+    Transport semantics & security boundaries:
+    - Bounded stream parsing: `BoundedJSONParser` consumes at most (MAX_BYTES + 1) bytes
+      from the request stream, raising an early 413 error if exceeded.
+    - WSGI/ASGI buffering: WSGI servers (e.g. gunicorn) or reverse proxies (e.g. nginx)
+      may buffer request bodies at the socket layer prior to handing them to the WSGI worker.
+      The bounded stream reader defends application process memory against unbounded JSON
+      deserialization and processing DoS.
+    """
+
+    permission_classes = [IsAuthenticated]
+    parser_classes = [BoundedJSONParser]
+
+    def post(self, request: Request) -> Response:
+        # 1. Content-Length early optimization check (never relied upon exclusively)
+        content_length = request.META.get("CONTENT_LENGTH")
+        if content_length:
+            try:
+                if int(content_length) > MAX_WORKFLOW_PORTABILITY_SIZE_BYTES:
+                    return Response(
+                        {
+                            "detail": f"Import payload exceeds maximum allowed size of {MAX_WORKFLOW_PORTABILITY_SIZE_BYTES} bytes."
+                        },
+                        status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    )
+            except (ValueError, TypeError):
+                pass
+        elif content_length == "" or (content_length is None and request.stream is None):
+            # Missing or ambiguous zero-length framing where stream is unavailable
+            # Fall through to parser which handles empty body with 400
+            pass
+
+        # 2. Access parsed data from BoundedJSONParser (which performs bounded stream reading)
+        try:
+            parsed_data = request.data
+        except BoundedPayloadTooLargeError:
+            return Response(
+                {
+                    "detail": f"Import payload exceeds maximum allowed size of {MAX_WORKFLOW_PORTABILITY_SIZE_BYTES} bytes."
+                },
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+
+        if not parsed_data:
+            return Response(
+                {"detail": "Request body cannot be empty."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = WorkflowImportSerializer(data=parsed_data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        validated_name = serializer.validated_data["name"]
+        validated_steps = serializer.validated_data["steps"]
+
+        with transaction.atomic():
+            new_wf = WorkflowDefinition.objects.create(
+                owner=request.user,
+                name=validated_name,
+                steps=validated_steps,
+                is_archived=False,
+                archived_at=None,
+            )
+
+        response_data = WorkflowDefinitionSerializer(new_wf, context={"request": request}).data
+        location = f"/api/v1/workflows/{new_wf.id}/"
         return Response(
             response_data, status=status.HTTP_201_CREATED, headers={"Location": location}
         )
