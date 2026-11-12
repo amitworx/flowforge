@@ -49,10 +49,10 @@ def read_bounded_request_stream(
     stream: Any, max_bytes: int = MAX_WORKFLOW_PORTABILITY_SIZE_BYTES
 ) -> bytes:
     """
-    Reads at most (max_bytes + 1) bytes from an incoming stream in bounded chunks.
+    Reads at most (max_bytes + 1) bytes from a framework-provided request stream in bounded chunks.
     Raises BoundedPayloadTooLargeError as soon as accumulated bytes exceed max_bytes.
     This guarantees that unparsed payload data never consumes unbounded memory.
-    Handles Django test FakePayload len semantics gracefully.
+    Handles Django test FakePayload len semantics gracefully without reading beyond framing.
     """
     accumulated = bytearray()
     chunk_size = min(max_bytes + 1, 8192)
@@ -87,23 +87,28 @@ def read_bounded_request_stream(
 class BoundedJSONParser(BaseParser):
     """
     DRF Parser for application/json that enforces strict byte length constraints
-    at the stream level before parsing JSON into memory, rejecting oversized payloads
-    and non-standard JSON literals (NaN, Infinity).
+    at the stream level before parsing JSON into memory, respecting the framework's
+    request-scoped stream framing.
+
+    Transport Semantics & Boundaries:
+    - In standard WSGI (PEP 3333) and Django (`WSGIRequest`), `stream` wraps `environ['wsgi.input']`
+      with a `LimitedStream` bounded by the declared `Content-Length`.
+    - This parser reads exclusively from the framework-provided `stream` without bypassing
+      or directly reading `environ['wsgi.input']`, guaranteeing that bytes from any subsequent
+      pipelined HTTP request are never consumed.
+    - If the incoming stream exceeds 64 KiB (65,536 bytes), reading stops at exactly 65,537 bytes
+      and raises `BoundedPayloadTooLargeError`, returning HTTP 413 Payload Too Large before JSON decoding.
+    - Server/Proxy framing is authoritative: if an upstream client sends an inaccurate-small Content-Length,
+      the WSGI server frames the body to that declared size and does not expose additional socket bytes.
     """
 
     media_type = "application/json"
 
     def parse(self, stream, media_type=None, parser_context=None):  # noqa: ARG002
-        # Determine the underlying raw stream if wrapped in Django's WSGIRequest or LimitedStream
-        raw_stream = stream
-        if parser_context and "request" in parser_context:
-            req = parser_context["request"]
-            # Look up raw WSGI input stream from environ to defend against inaccurate-small Content-Length
-            wsgi_input = getattr(req, "environ", {}).get("wsgi.input")
-            if wsgi_input is not None and hasattr(wsgi_input, "read"):
-                raw_stream = wsgi_input
+        if stream is None:
+            raise ParseError("Request body cannot be empty.")
 
-        raw_bytes = read_bounded_request_stream(raw_stream, MAX_WORKFLOW_PORTABILITY_SIZE_BYTES)
+        raw_bytes = read_bounded_request_stream(stream, MAX_WORKFLOW_PORTABILITY_SIZE_BYTES)
         if not raw_bytes:
             raise ParseError("Request body cannot be empty.")
 

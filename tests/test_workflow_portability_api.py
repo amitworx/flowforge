@@ -405,9 +405,8 @@ class TestWorkflowPortabilitySizeLimits:
         assert response.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
 
     def test_import_missing_content_length_oversized_rejected_with_413(self, auth_client):
-        # Stream or raw body where Content-Length is omitted or large
+        # Stream or raw body where Content-Length is omitted but stream provides oversized payload
         oversized_data = b" " * 70000
-        # Post with WSGI environ lacking CONTENT_LENGTH
         response = auth_client.generic(
             "POST",
             "/api/v1/workflows/import/",
@@ -416,20 +415,84 @@ class TestWorkflowPortabilitySizeLimits:
         )
         assert response.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
 
-    def test_import_inaccurate_small_content_length_bounded_stream_rejected_with_413(
-        self, auth_client
-    ):
-        # Header claims 10 bytes, but body sends 70,000 bytes.
-        # Bounded stream reader must read max 65537 bytes and return 413, not crash or accept.
-        oversized_data = b" " * 70000
-        response = auth_client.generic(
-            "POST",
-            "/api/v1/workflows/import/",
-            data=oversized_data,
-            content_type="application/json",
-            CONTENT_LENGTH="10",
-        )
-        assert response.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+    def test_parser_respects_framework_request_framing_and_never_reads_next_request(self):
+        """
+        Proof of Request-Scoped Stream Framing:
+        1. BoundedJSONParser must NOT bypass the framework stream or directly access environ['wsgi.input'].
+        2. A request-scoped stream framing sentinel must verify that no bytes past the declared limit are read.
+        3. Concatenated bytes belonging to a subsequent HTTP request must remain completely unread.
+        """
+        import io
+
+        from flowforge.workflows.portability import BoundedJSONParser
+
+        # Request 1 payload: valid 124-byte workflow definition
+        req1_data = json.dumps(
+            {
+                "format": "flowforge.workflow",
+                "format_version": 1,
+                "name": "Scoped WF",
+                "steps": [{"op": "select_columns", "columns": ["id"]}],
+            }
+        ).encode("utf-8")
+        # Request 2 payload: simulated subsequent pipelined request on same TCP connection
+        req2_data = b"POST /api/v1/workflows/import/ HTTP/1.1\r\nHost: example.com\r\n\r\n"
+
+        concatenated_socket_stream = io.BytesIO(req1_data + req2_data)
+
+        class SentinelFramedStream:
+            def __init__(self, raw_socket, limit):
+                self.raw_socket = raw_socket
+                self.limit = limit
+                self.bytes_read = 0
+
+            def read(self, size=-1):
+                if self.bytes_read >= self.limit:
+                    return b""
+                if size == -1 or size is None:
+                    to_read = self.limit - self.bytes_read
+                else:
+                    to_read = min(size, self.limit - self.bytes_read)
+                chunk = self.raw_socket.read(to_read)
+                self.bytes_read += len(chunk)
+                return chunk
+
+        framed_stream = SentinelFramedStream(concatenated_socket_stream, len(req1_data))
+
+        parser = BoundedJSONParser()
+        # Parse using framework-provided request stream
+        parsed_result = parser.parse(framed_stream)
+
+        # Assert correct parsing of request 1
+        assert parsed_result["name"] == "Scoped WF"
+        assert parsed_result["format"] == "flowforge.workflow"
+
+        # Assert exactly len(req1_data) bytes were read, and zero bytes from request 2 were consumed
+        assert framed_stream.bytes_read == len(req1_data)
+        assert concatenated_socket_stream.tell() == len(req1_data)
+        remaining_bytes = concatenated_socket_stream.read()
+        assert remaining_bytes == req2_data
+
+    def test_parser_stops_at_max_plus_one_on_oversized_stream(self):
+        """
+        Proof of Upper Bounded Read:
+        On an oversized framed stream (> 64 KiB), the parser must abort at exactly
+        64 KiB + 1 (65,537 bytes) without consuming the rest of the stream.
+        """
+        import io
+
+        from flowforge.workflows.portability import BoundedJSONParser, BoundedPayloadTooLargeError
+
+        total_size = 100000
+        oversized_socket = io.BytesIO(b"X" * total_size)
+
+        parser = BoundedJSONParser()
+        with pytest.raises(BoundedPayloadTooLargeError) as exc_info:
+            parser.parse(oversized_socket)
+
+        assert "65536" in str(exc_info.value)
+        # Exactly 65,537 bytes read from the stream
+        assert oversized_socket.tell() == 65537
 
     def test_import_unicode_multibyte_exact_byte_boundary(self, auth_client):
         # Multi-byte UTF-8 characters (e.g. 3-byte '€' or 4-byte '🚀')

@@ -823,6 +823,10 @@ class WorkflowImportView(APIView):
                     )
             except (ValueError, TypeError):
                 pass
+        elif content_length == "" or (content_length is None and request.stream is None):
+            # Missing or ambiguous zero-length framing where stream is unavailable
+            # Fall through to parser which handles empty body with 400
+            pass
 
         # 2. Access parsed data from BoundedJSONParser (which performs bounded stream reading)
         try:
@@ -833,6 +837,12 @@ class WorkflowImportView(APIView):
                     "detail": f"Import payload exceeds maximum allowed size of {MAX_WORKFLOW_PORTABILITY_SIZE_BYTES} bytes."
                 },
                 status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+
+        if not parsed_data:
+            return Response(
+                {"detail": "Request body cannot be empty."},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         serializer = WorkflowImportSerializer(data=parsed_data)
