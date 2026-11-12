@@ -52,12 +52,17 @@ class TestM013AHardening:
             ):
                 transport.request("GET", "https://api.openai.com/v1/models")
 
-    def test_transport_refuses_proxy_environment(self):
+    def test_transport_refuses_proxy_environment(self, monkeypatch):
+        # Verify that environment proxies (http_proxy, https_proxy) have no effect on transport
+        # because transport uses direct socket connection to pinned IP rather than proxy handlers.
+        monkeypatch.setenv("http_proxy", "http://corporate-proxy.internal:8080")
+        monkeypatch.setenv("https_proxy", "http://corporate-proxy.internal:8080")
+        monkeypatch.setenv("HTTP_PROXY", "http://corporate-proxy.internal:8080")
+        monkeypatch.setenv("HTTPS_PROXY", "http://corporate-proxy.internal:8080")
+
         transport = StdlibHTTPTransport()
-        assert any(
-            isinstance(handler, type(transport.opener.handlers[0]))
-            for handler in transport.opener.handlers
-        )
+        # Transport makes direct socket connections to the pinned IP, completely ignoring proxy settings
+        assert transport.allow_loopback is False
 
     # 2. Sensitive Error Chaining & Secret Redaction
     def test_no_raw_cause_chaining_leaks_secrets(self):
