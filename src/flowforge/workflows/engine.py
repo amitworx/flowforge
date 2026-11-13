@@ -10,7 +10,6 @@ from flowforge.ai.providers import (
     LLMProvider,
     LLMRequest,
     ProviderError,
-    sanitize_error_message,
 )
 from flowforge.ai.safety import (
     AISafetyError,
@@ -64,6 +63,37 @@ ALLOWED_LLM_PROVIDERS = {"ollama", "openai"}
 
 # Template variable regex: {{ column_name }} with strict identifier rules
 _TEMPLATE_VAR_REGEX = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
+
+
+def _estimate_prompt_tokens(prompt: str) -> int:
+    """Conservative prompt token estimation (roughly 1 token per 3 chars, minimum 1)."""
+    return max(1, math.ceil(len(prompt) / 3))
+
+
+def _classify_provider_error_reason(exc: Exception) -> str:
+    """Map external exceptions to safe, generic, allowlisted error reasons.
+
+    Never echoes raw str(exc), prompts, bodies, URLs, or unredacted keys.
+    """
+    if isinstance(exc, AISafetyError):
+        return f"Safety policy violation ({type(exc).__name__})"
+
+    if isinstance(exc, ProviderError):
+        exc_type = type(exc).__name__
+        if "Auth" in exc_type:
+            return "Authentication or credentials error with upstream AI provider"
+        if "Timeout" in exc_type:
+            return "Upstream AI provider request timed out"
+        if "Connection" in exc_type:
+            return "Connection error reaching upstream AI provider"
+        if "Response" in exc_type or "Invalid" in exc_type:
+            return "Invalid response or request payload for AI provider"
+        return "Upstream AI provider error occurred"
+
+    if isinstance(exc, TimeoutError):
+        return "Upstream AI provider request timed out"
+
+    return "Upstream AI provider failure"
 
 
 def _is_valid_scalar(val: Any) -> bool:
@@ -396,10 +426,21 @@ def execute_step_with_schema(
             return [], new_schema
 
         provider_type = step["provider"]
-        # Opt-in guard: require explicit LLMProvider injection (either single or multi-provider map)
-        effective_provider = (
-            llm_providers.get(provider_type) if llm_providers else None
-        ) or llm_provider
+        # Explicit provider resolution: if llm_providers mapping is provided,
+        # require explicit mapping for provider_type (no silent fallback to other providers).
+        if llm_providers is not None:
+            if not llm_providers:
+                raise WorkflowExecutionError(
+                    "LLM execution is opt-in and requires an explicit, secure provider instance."
+                )
+            effective_provider = llm_providers.get(provider_type)
+            if effective_provider is None:
+                raise WorkflowExecutionError(
+                    f"No provider configured for '{provider_type}' in multi-provider mapping."
+                )
+        else:
+            effective_provider = llm_provider
+
         if effective_provider is None:
             raise WorkflowExecutionError(
                 "LLM execution is opt-in and requires an explicit, secure provider instance."
@@ -452,11 +493,28 @@ def execute_step_with_schema(
                 max_output_tokens=int(max_output_tokens),
             )
 
-            # Check budget limits before calling provider
-            if budget_tracker and (budget_tracker.calls_count + 1 > budget_tracker.max_ai_calls):
-                raise WorkflowExecutionError(
-                    f"AI execution budget exceeded: call limit reached ({budget_tracker.calls_count}/{budget_tracker.max_ai_calls})"
-                )
+            # Atomic pre-call budget reservation:
+            # 1. Check call count limit
+            # 2. Check conservative token allowance (prompt tokens + max_output_tokens)
+            if budget_tracker:
+                if budget_tracker.calls_count + 1 > budget_tracker.max_ai_calls:
+                    raise WorkflowExecutionError(
+                        f"AI execution budget exceeded: call limit reached ({budget_tracker.calls_count}/{budget_tracker.max_ai_calls})"
+                    )
+
+                estimated_prompt_tokens = _estimate_prompt_tokens(rendered_prompt)
+                conservative_tokens = estimated_prompt_tokens + int(max_output_tokens)
+                if (
+                    budget_tracker.tokens_count + conservative_tokens
+                    > budget_tracker.max_total_tokens
+                ):
+                    raise WorkflowExecutionError(
+                        f"AI execution budget exceeded: token limit ({budget_tracker.max_total_tokens}) would be exceeded by estimated request ({conservative_tokens} tokens, current: {budget_tracker.tokens_count})"
+                    )
+
+                # Atomically reserve 1 call attempt upfront
+                with budget_tracker._lock:
+                    budget_tracker._calls_count += 1
 
             try:
                 resp = effective_provider.generate(req)
@@ -475,13 +533,22 @@ def execute_step_with_schema(
                 )
 
                 if budget_tracker:
-                    tokens_used = resp.usage.total_tokens if resp.usage else 0
-                    budget_tracker.record_call(tokens_used=tokens_used)
+                    actual_tokens = resp.usage.total_tokens if resp.usage else 0
+                    with budget_tracker._lock:
+                        if (
+                            budget_tracker._tokens_count + actual_tokens
+                            > budget_tracker.max_total_tokens
+                        ):
+                            raise WorkflowExecutionError(
+                                f"AI execution budget exceeded: total token limit ({budget_tracker.max_total_tokens}) exceeded"
+                            )
+                        budget_tracker._tokens_count += actual_tokens
 
             except (AISafetyError, ProviderError, Exception) as exc:
-                clean_err = sanitize_error_message(str(exc))
-                clean_err = redact_secrets_from_text(clean_err)
-                raise WorkflowExecutionError(f"LLM generation failed: {clean_err}") from None
+                if isinstance(exc, WorkflowExecutionError):
+                    raise
+                reason = _classify_provider_error_reason(exc)
+                raise WorkflowExecutionError(f"LLM generation failed: {reason}") from None
 
             new_row = dict(row)
             new_row[output_col] = sanitized_output
@@ -523,14 +590,14 @@ def execute_workflow_pipeline_with_schema(
         input_count = len(current_data)
         op = step["op"]
 
-        if op == "llm_generate":
-            cumulative_ai_rows += input_count
-            if cumulative_ai_rows > MAX_AI_ROWS_PER_WORKFLOW:
-                raise WorkflowExecutionError(
-                    f"Cumulative AI rows across workflow ({cumulative_ai_rows}) exceeds max allowed limit of {MAX_AI_ROWS_PER_WORKFLOW}."
-                )
-
         try:
+            if op == "llm_generate":
+                cumulative_ai_rows += input_count
+                if cumulative_ai_rows > MAX_AI_ROWS_PER_WORKFLOW:
+                    raise WorkflowExecutionError(
+                        f"Cumulative AI rows across workflow ({cumulative_ai_rows}) exceeds max allowed limit of {MAX_AI_ROWS_PER_WORKFLOW}."
+                    )
+
             current_data, current_schema = execute_step_with_schema(
                 current_data,
                 step,

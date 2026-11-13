@@ -123,7 +123,7 @@ def test_pipeline_rejects_mixed_providers_if_unsupported():
 
 
 def test_budget_tracker_records_exactly_one_call_per_invocation():
-    tracker = ExecutionBudgetTracker(max_ai_calls=2, max_total_tokens=100)
+    tracker = ExecutionBudgetTracker(max_ai_calls=2, max_total_tokens=10_000)
     provider = MockLLMProvider(responses=["Resp 1", "Resp 2"])
 
     step = {
@@ -142,7 +142,7 @@ def test_budget_tracker_records_exactly_one_call_per_invocation():
 
 
 def test_budget_tracker_stops_before_extra_network_call():
-    tracker = ExecutionBudgetTracker(max_ai_calls=1, max_total_tokens=100)
+    tracker = ExecutionBudgetTracker(max_ai_calls=1, max_total_tokens=10_000)
     provider = MockLLMProvider(responses=["Resp 1", "Resp 2"])
 
     step = {
@@ -163,7 +163,7 @@ def test_budget_tracker_stops_before_extra_network_call():
 
 
 def test_budget_enforced_across_multiple_steps_in_pipeline():
-    tracker = ExecutionBudgetTracker(max_ai_calls=3, max_total_tokens=100)
+    tracker = ExecutionBudgetTracker(max_ai_calls=3, max_total_tokens=10_000)
     provider = MockLLMProvider(responses=["A1", "A2", "B1"])
 
     steps = [
