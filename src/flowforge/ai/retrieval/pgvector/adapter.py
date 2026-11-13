@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -10,7 +11,14 @@ import psycopg
 from psycopg import sql
 
 from flowforge.ai.retrieval.exceptions import RetrievalContractError
-from flowforge.ai.retrieval.pgvector.config import PgVectorConfig
+from flowforge.ai.retrieval.pgvector.config import (
+    MAX_BATCH_SIZE,
+    MAX_METADATA_DEPTH,
+    MAX_METADATA_SIZE_BYTES,
+    MAX_TEXT_CONTENT_LENGTH,
+    MAX_TOP_K,
+    PgVectorConfig,
+)
 from flowforge.ai.retrieval.pgvector.exceptions import (
     PgVectorError,
     PgVectorExtensionUnavailableError,
@@ -30,16 +38,38 @@ from flowforge.ai.retrieval.validation import (
 )
 
 
+def _check_metadata_depth(obj: Any, current_depth: int = 1) -> None:
+    """Validate that nested metadata does not exceed MAX_METADATA_DEPTH."""
+    if current_depth > MAX_METADATA_DEPTH:
+        raise RetrievalContractError(
+            f"Metadata nesting depth exceeds maximum allowed limit ({MAX_METADATA_DEPTH})"
+        )
+    if isinstance(obj, dict):
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                _check_metadata_depth(v, current_depth + 1)
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)):
+                _check_metadata_depth(item, current_depth + 1)
+
+
 class PgVectorIndex(VectorIndex):
     """PostgreSQL + pgvector implementation of VectorIndex protocol.
 
     Features:
     - Pure tenant isolation enforced strictly at the database SQL query level (WHERE tenant_id = %s).
+    - Note on authorization: tenant_id parameter scopes SQL data boundaries. Callers MUST ensure
+      tenant_id is authenticated and resolved from authorized session/user context before passing here.
     - Parameterized queries throughout (no dynamic SQL interpolation).
+    - Full floating-point precision vector serialization (no precision truncation).
+    - Rejects zero-magnitude vectors for Cosine metric to prevent NaN/Inf cosine distance.
+    - Strict bounds on top_k, batch size, text length, and metadata depth/size.
+    - Least privilege: auto_bootstrap and create_extension default to False.
     - Graceful pgvector extension detection and bootstrap handling.
     - Idempotent upsert via ON CONFLICT (tenant_id, id) DO UPDATE.
     - Deterministic score calculation and tie-breaking by document ID.
-    - Explicit delete method with tenant isolation.
+    - Explicit delete method with strict tenant isolation.
     """
 
     def __init__(
@@ -133,8 +163,17 @@ class PgVectorIndex(VectorIndex):
 
     @staticmethod
     def _format_vector(vector: tuple[float, ...]) -> str:
-        """Format a sequence of floats as a pgvector literal string '[v1,v2,...]'."""
-        return "[" + ",".join(f"{float(v):.8g}" for v in vector) + "]"
+        """Format a sequence of floats as a pgvector literal string '[v1,v2,...]' with full precision."""
+        return "[" + ",".join(repr(float(v)) for v in vector) + "]"
+
+    def _validate_vector_magnitude(self, vector: tuple[float, ...]) -> None:
+        """Verify vector magnitude is non-zero for cosine similarity metric."""
+        if self._config.metric.value == "cosine":
+            norm_sq = sum(float(x) ** 2 for x in vector)
+            if norm_sq == 0.0 or math.isclose(norm_sq, 0.0, abs_tol=1e-12):
+                raise RetrievalContractError(
+                    "Zero-magnitude vector is invalid for cosine distance metric (causes division by zero)"
+                )
 
     def upsert(
         self,
@@ -146,9 +185,10 @@ class PgVectorIndex(VectorIndex):
         Enforces:
         - Strict tenant isolation: document.tenant_id must match parameter tenant_id.
         - Dimension check against config.dimension.
-        - Finite float values.
+        - Batch size capped at MAX_BATCH_SIZE.
+        - Finite float values and non-zero magnitude check for cosine metric.
+        - Text length and metadata depth/size bounds.
         - Parameterized INSERT ... ON CONFLICT (tenant_id, id) DO UPDATE.
-        - Deep copy of metadata to prevent external mutation leaks.
 
         Args:
             tenant_id: Tenant scope identifier.
@@ -162,12 +202,45 @@ class PgVectorIndex(VectorIndex):
         if not documents:
             return 0
 
+        if len(documents) > MAX_BATCH_SIZE:
+            raise RetrievalContractError(
+                f"Batch size exceeds maximum allowed limit ({len(documents)} > {MAX_BATCH_SIZE})"
+            )
+
         # Validate documents using retrieval validation helper
         validate_vector_documents(
             documents,
             expected_tenant_id=valid_tenant,
             expected_dimension=self._config.dimension,
         )
+
+        # Validate magnitudes, text content length, and metadata bounds
+        upsert_params = []
+        for doc in documents:
+            self._validate_vector_magnitude(doc.vector)
+
+            if len(doc.content) > MAX_TEXT_CONTENT_LENGTH:
+                raise RetrievalContractError(
+                    f"Document '{doc.id}' content length exceeds maximum limit ({len(doc.content)} > {MAX_TEXT_CONTENT_LENGTH})"
+                )
+
+            meta = dict(doc.metadata) if doc.metadata else {}
+            _check_metadata_depth(meta)
+            meta_json = json.dumps(meta)
+            if len(meta_json.encode("utf-8")) > MAX_METADATA_SIZE_BYTES:
+                raise RetrievalContractError(
+                    f"Document '{doc.id}' metadata size exceeds maximum limit of {MAX_METADATA_SIZE_BYTES} bytes"
+                )
+
+            upsert_params.append(
+                (
+                    valid_tenant,
+                    doc.id,
+                    self._format_vector(doc.vector),
+                    doc.content,
+                    meta_json,
+                )
+            )
 
         with self._connection_factory() as conn:
             self._ensure_bootstrapped(conn)
@@ -185,17 +258,6 @@ class PgVectorIndex(VectorIndex):
                     """
                 ).format(table=table)
 
-                upsert_params = [
-                    (
-                        valid_tenant,
-                        doc.id,
-                        self._format_vector(doc.vector),
-                        doc.content,
-                        json.dumps(dict(doc.metadata) if doc.metadata else {}),
-                    )
-                    for doc in documents
-                ]
-
                 cur.executemany(upsert_sql, upsert_params)
                 conn.commit()
                 return len(documents)
@@ -208,12 +270,13 @@ class PgVectorIndex(VectorIndex):
 
         Enforces:
         - Strict tenant isolation: query is executed with WHERE tenant_id = %s.
+        - top_k bounded by MAX_TOP_K.
         - Dimension validation of query_vector.
+        - Non-zero vector magnitude check for cosine similarity.
         - Operator-based distance metric calculation with parameterized query vector.
         - Safe parameterized metadata filters.
         - Deterministic ordering: primary score descending, tie-breaker id ascending.
         - Score threshold filtering.
-        - Top-k bounding.
 
         Args:
             query: QueryBundle specifying tenant scope, query vector, top_k, threshold, filters.
@@ -224,14 +287,20 @@ class PgVectorIndex(VectorIndex):
         validate_query_bundle(query)
         tenant_id = validate_tenant_scope(query.tenant_id)
 
+        if query.top_k > MAX_TOP_K:
+            raise RetrievalContractError(
+                f"top_k exceeds maximum allowed limit ({query.top_k} > {MAX_TOP_K})"
+            )
+
         if query.query_vector is None:
-            # Protocol supports query_vector or query_text; pgvector requires query_vector
             raise RetrievalContractError("PgVectorIndex requires query_vector in QueryBundle")
 
         if len(query.query_vector) != self._config.dimension:
             raise RetrievalContractError(
                 f"Query vector dimension {len(query.query_vector)} does not match configured dimension {self._config.dimension}"
             )
+
+        self._validate_vector_magnitude(query.query_vector)
 
         filter_sql, filter_params = compile_metadata_filters(query.filter_metadata)
         vector_str = self._format_vector(query.query_vector)
@@ -250,9 +319,7 @@ class PgVectorIndex(VectorIndex):
                     LIMIT %s
                 """
 
-                # Retrieve up to top_k * 2 if score_threshold is present to ensure proper filtering
                 fetch_limit = max(query.top_k, 1)
-
                 search_sql = sql.SQL(search_sql_raw).format(table=table)
                 all_params = [vector_str, tenant_id, *filter_params, fetch_limit]
 
@@ -261,11 +328,15 @@ class PgVectorIndex(VectorIndex):
 
                 results: list[SearchResult] = []
                 for row_id, content, metadata_raw, dist in rows:
-                    score = self._config.metric.score_from_distance(float(dist))
+                    dist_float = float(dist)
+                    if math.isnan(dist_float) or math.isinf(dist_float):
+                        # Safeguard against unexpected NaN/Inf in distance
+                        continue
+
+                    score = self._config.metric.score_from_distance(dist_float)
                     if query.score_threshold is not None and score < query.score_threshold:
                         continue
 
-                    # Deep copy metadata
                     if isinstance(metadata_raw, str):
                         meta = json.loads(metadata_raw)
                     elif isinstance(metadata_raw, dict):
@@ -305,10 +376,25 @@ class PgVectorIndex(VectorIndex):
             Number of rows deleted.
         """
         valid_tenant = validate_tenant_scope(tenant_id)
+
+        if not isinstance(document_ids, list):
+            raise RetrievalContractError(
+                f"document_ids must be a list of strings, got {type(document_ids).__name__}"
+            )
+
         if not document_ids:
             return 0
 
-        clean_ids = [str(doc_id) for doc_id in document_ids if str(doc_id).strip()]
+        clean_ids: list[str] = []
+        for item in document_ids:
+            if not isinstance(item, str):
+                raise RetrievalContractError(
+                    f"Each document ID in document_ids must be a string, got {type(item).__name__}"
+                )
+            stripped = item.strip()
+            if stripped:
+                clean_ids.append(stripped)
+
         if not clean_ids:
             return 0
 

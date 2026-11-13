@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from flowforge.ai.retrieval.pgvector.config import MAX_FILTER_IN_ITEMS
 from flowforge.ai.retrieval.pgvector.exceptions import PgVectorFilterError
 
 _SAFE_KEY_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_\.]{0,63}$")
@@ -20,17 +21,18 @@ def compile_metadata_filters(
     - Metadata keys must match safe identifier pattern (alphanumeric, underscore, dot).
     - Keys and values are NEVER interpolated into SQL strings; values are strictly bound parameters.
     - Supported filter formats:
-        - `{"key": "value"}` -> metadata->>'key' = %s
-        - `{"key": {"$eq": "value"}}` -> metadata->>'key' = %s
-        - `{"key": {"$ne": "value"}}` -> (metadata->>'key' IS NULL OR metadata->>'key' != %s)
-        - `{"key": {"$in": ["val1", "val2"]}}` -> metadata->>'key' = ANY(%s)
+        - `{"key": "value"}` -> metadata->>%s = %s
+        - `{"key": {"$eq": "value"}}` -> metadata->>%s = %s
+        - `{"key": {"$ne": "value"}}` -> (metadata->>%s IS NULL OR metadata->>%s != %s)
+        - `{"key": {"$in": ["val1", "val2"]}}` -> metadata->>%s = ANY(%s)
+    - Bounds: $in list length is capped at MAX_FILTER_IN_ITEMS.
 
     Returns:
         tuple of (sql_clause_fragment, param_list)
         where sql_clause_fragment starts with ' AND ...' if filters exist, or '' if empty.
 
     Raises:
-        PgVectorFilterError: If filter keys or operators are invalid.
+        PgVectorFilterError: If filter keys, operators, or bound lengths are invalid.
     """
     if not filters:
         return "", []
@@ -65,6 +67,10 @@ def compile_metadata_filters(
                     if not isinstance(op_val, (list, tuple, set)):
                         raise PgVectorFilterError(
                             f"Operator $in expects a list/tuple/set, got {type(op_val).__name__}"
+                        )
+                    if len(op_val) > MAX_FILTER_IN_ITEMS:
+                        raise PgVectorFilterError(
+                            f"$in operator exceeds maximum allowed items ({len(op_val)} > {MAX_FILTER_IN_ITEMS})"
                         )
                     str_list = [str(item) for item in op_val]
                     clauses.append("metadata->>%s = ANY(%s)")
