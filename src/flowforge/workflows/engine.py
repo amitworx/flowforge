@@ -1,5 +1,6 @@
 """Pure Python deterministic workflow execution engine."""
 
+import math
 import re
 from typing import Any
 
@@ -61,9 +62,8 @@ STEP_ALLOWED_FIELDS = {
 
 ALLOWED_LLM_PROVIDERS = {"ollama", "openai"}
 
-# Template variable regex: {{ column_name }}
-_TEMPLATE_VAR_REGEX = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
-_UNMATCHED_BRACES_REGEX = re.compile(r"\{\{[^}]*\}\}")
+# Template variable regex: {{ column_name }} with strict identifier rules
+_TEMPLATE_VAR_REGEX = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 
 
 def _is_valid_scalar(val: Any) -> bool:
@@ -204,12 +204,20 @@ def validate_step_definitions(steps: Any) -> list[dict[str, Any]]:
                     f"Step {idx} (llm_generate): 'prompt_template' must be a non-empty string."
                 )
 
-            # Validate that all {{...}} patterns match allowable scalar column identifiers
-            all_braces = _UNMATCHED_BRACES_REGEX.findall(prompt_tmpl)
+            # Validate that all {{...}} patterns match allowable scalar column identifiers,
+            # and reject any malformed braces (e.g. {{, }}, {{}}, invalid characters)
+            braces_pattern = re.compile(r"\{\{([^}]*)\}\}")
+            found_braces = braces_pattern.findall(prompt_tmpl)
             valid_vars = _TEMPLATE_VAR_REGEX.findall(prompt_tmpl)
-            if len(all_braces) != len(valid_vars):
+            if prompt_tmpl.count("{{") != len(found_braces) or prompt_tmpl.count("}}") != len(
+                found_braces
+            ):
                 raise WorkflowExecutionError(
                     f"Step {idx} (llm_generate): Invalid template placeholder syntax in prompt_template."
+                )
+            if len(found_braces) != len(valid_vars):
+                raise WorkflowExecutionError(
+                    f"Step {idx} (llm_generate): Invalid template placeholder identifier in prompt_template."
                 )
             for var in valid_vars:
                 if not var[0].isalpha() and var[0] != "_":
@@ -252,6 +260,7 @@ def validate_step_definitions(steps: Any) -> list[dict[str, Any]]:
                 if (
                     isinstance(temp, bool)
                     or not isinstance(temp, (int, float))
+                    or not math.isfinite(temp)
                     or temp < 0.0
                     or temp > 2.0
                 ):
@@ -268,6 +277,7 @@ def execute_step(
     step: dict[str, Any],
     schema: list[str] | None = None,
     llm_provider: LLMProvider | None = None,
+    llm_providers: dict[str, LLMProvider] | None = None,
     budget_tracker: ExecutionBudgetTracker | None = None,
 ) -> list[dict[str, Any]]:
     """
@@ -276,7 +286,12 @@ def execute_step(
     If schema is provided, modifies schema in-place (or caller uses execute_step_with_schema).
     """
     transformed_data, new_schema = execute_step_with_schema(
-        data, step, schema, llm_provider=llm_provider, budget_tracker=budget_tracker
+        data,
+        step,
+        schema,
+        llm_provider=llm_provider,
+        llm_providers=llm_providers,
+        budget_tracker=budget_tracker,
     )
     if schema is not None:
         schema.clear()
@@ -289,6 +304,7 @@ def execute_step_with_schema(
     step: dict[str, Any],
     schema: list[str] | None = None,
     llm_provider: LLMProvider | None = None,
+    llm_providers: dict[str, LLMProvider] | None = None,
     budget_tracker: ExecutionBudgetTracker | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """
@@ -379,8 +395,12 @@ def execute_step_with_schema(
         if not data:
             return [], new_schema
 
-        # Opt-in guard: require explicit LLMProvider injection
-        if llm_provider is None:
+        provider_type = step["provider"]
+        # Opt-in guard: require explicit LLMProvider injection (either single or multi-provider map)
+        effective_provider = (
+            llm_providers.get(provider_type) if llm_providers else None
+        ) or llm_provider
+        if effective_provider is None:
             raise WorkflowExecutionError(
                 "LLM execution is opt-in and requires an explicit, secure provider instance."
             )
@@ -432,10 +452,14 @@ def execute_step_with_schema(
                 max_output_tokens=int(max_output_tokens),
             )
 
+            # Check budget limits before calling provider
+            if budget_tracker and (budget_tracker.calls_count + 1 > budget_tracker.max_ai_calls):
+                raise WorkflowExecutionError(
+                    f"AI execution budget exceeded: call limit reached ({budget_tracker.calls_count}/{budget_tracker.max_ai_calls})"
+                )
+
             try:
-                if budget_tracker:
-                    budget_tracker.record_call(tokens_used=0)
-                resp = llm_provider.generate(req)
+                resp = effective_provider.generate(req)
                 resp_content = resp.text or ""
                 # Redact any inadvertent secret shapes from generated output
                 sanitized_output = redact_secrets_from_text(resp_content)
@@ -450,8 +474,9 @@ def execute_step_with_schema(
                     safety_limits,
                 )
 
-                if budget_tracker and resp.usage:
-                    budget_tracker.record_call(tokens_used=resp.usage.total_tokens)
+                if budget_tracker:
+                    tokens_used = resp.usage.total_tokens if resp.usage else 0
+                    budget_tracker.record_call(tokens_used=tokens_used)
 
             except (AISafetyError, ProviderError, Exception) as exc:
                 clean_err = sanitize_error_message(str(exc))
@@ -472,6 +497,7 @@ def execute_workflow_pipeline_with_schema(
     steps: list[dict[str, Any]],
     schema: list[str] | None = None,
     llm_provider: LLMProvider | None = None,
+    llm_providers: dict[str, LLMProvider] | None = None,
     budget_tracker: ExecutionBudgetTracker | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     """
@@ -491,16 +517,26 @@ def execute_workflow_pipeline_with_schema(
         current_schema = []
 
     completed_audits = []
+    cumulative_ai_rows = 0
 
     for idx, step in enumerate(steps):
         input_count = len(current_data)
         op = step["op"]
+
+        if op == "llm_generate":
+            cumulative_ai_rows += input_count
+            if cumulative_ai_rows > MAX_AI_ROWS_PER_WORKFLOW:
+                raise WorkflowExecutionError(
+                    f"Cumulative AI rows across workflow ({cumulative_ai_rows}) exceeds max allowed limit of {MAX_AI_ROWS_PER_WORKFLOW}."
+                )
+
         try:
             current_data, current_schema = execute_step_with_schema(
                 current_data,
                 step,
                 schema=current_schema,
                 llm_provider=llm_provider,
+                llm_providers=llm_providers,
                 budget_tracker=budget_tracker,
             )
             output_count = len(current_data)
@@ -538,6 +574,7 @@ def execute_workflow_pipeline(
     steps: list[dict[str, Any]],
     schema: list[str] | None = None,
     llm_provider: LLMProvider | None = None,
+    llm_providers: dict[str, LLMProvider] | None = None,
     budget_tracker: ExecutionBudgetTracker | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """
@@ -545,6 +582,11 @@ def execute_workflow_pipeline(
     Preserves backward compatibility returning (output_data, step_audits).
     """
     output_data, audits, _schema = execute_workflow_pipeline_with_schema(
-        data, steps, schema=schema, llm_provider=llm_provider, budget_tracker=budget_tracker
+        data,
+        steps,
+        schema=schema,
+        llm_provider=llm_provider,
+        llm_providers=llm_providers,
+        budget_tracker=budget_tracker,
     )
     return output_data, audits
