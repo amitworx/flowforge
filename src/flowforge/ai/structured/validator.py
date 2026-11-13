@@ -609,19 +609,12 @@ def _validate_object(value: dict[str, Any], schema: dict[str, Any], path: Valida
     if additional is False:
         extra_keys = sorted(set(value.keys()) - set(properties.keys()))
         if extra_keys:
-            # Safe error: report count of unexpected properties and bounded sanitized
-            # keys without leaking arbitrary values or unbounded payload fragments.
-            safe_names = []
-            for k in extra_keys:
-                clean_k = str(k)[:30]
-                # Replace control characters
-                clean_k = "".join(ch if 32 <= ord(ch) <= 126 else "_" for ch in clean_k)
-                safe_names.append(repr(clean_k))
-            joined_names = ", ".join(safe_names[:5])
-            if len(safe_names) > 5:
-                joined_names += f" (and {len(safe_names) - 5} more)"
+            # Safe error: report ONLY generic bounded count metadata.
+            # Never leak raw, truncated, or escaped model-controlled property names.
+            count = len(extra_keys)
+            prop_str = "property" if count == 1 else "properties"
             raise ValidationError(
-                f"additional properties not allowed: {joined_names}",
+                f"additional properties not allowed (found {count} unexpected {prop_str})",
                 path=path,
                 schema_type="object",
                 code="ADDITIONAL_PROPERTIES",

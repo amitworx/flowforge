@@ -442,7 +442,9 @@ class TestObjectValidation:
             _validate('{"name": "Alice", "extra": "oops"}', schema)
         err = exc_info.value
         assert err.code == "ADDITIONAL_PROPERTIES"
-        assert "extra" in str(err)
+        # Does NOT leak raw property name 'extra'; reports generic count metadata
+        assert "extra" not in str(err)
+        assert "1 unexpected" in str(err).lower() or "unexpected property" in str(err).lower()
 
     def test_additional_properties_true_allows_extras(self):
         schema = {
