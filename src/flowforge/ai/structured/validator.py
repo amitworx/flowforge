@@ -4,12 +4,14 @@ Public API
 ----------
 validate_structured_output(raw_text, schema) -> ValidatedOutput
     Parse ``raw_text`` as strict JSON and validate it against ``schema``.
+    Accepts ONLY ``str`` input (rejects bytes, int, None, dict, etc.).
     Raises ParseError, PayloadLimitError, ValidationError, or SchemaError.
     CPU-only, deterministic, no database or network calls.
 
 SchemaContract.from_dict(d) -> SchemaContract
     Statically validate a JSON Schema-like dict (small subset only) and
-    return a typed contract object.
+    return a typed contract object.  The input dict is deep-copied so
+    caller mutations cannot affect the contract after construction.
 
 Supported schema subset
 -----------------------
@@ -24,6 +26,19 @@ Duplicate object keys -> ParseError.
 Deep nesting (> MAX_NESTING_DEPTH) -> PayloadLimitError.
 Oversized payload (> MAX_PAYLOAD_BYTES) -> PayloadLimitError.
 Too many JSON nodes (> MAX_JSON_NODES) -> PayloadLimitError.
+Non-str input -> ParseError with safe message.
+
+Enum comparisons are type-sensitive: Python's True==1 and 1==1.0
+coercions are explicitly prevented via identity-based type checks.
+
+Schema numeric constraints are validated for finiteness, non-negativity,
+integrality (for length/item counts), and min<=max consistency.
+
+Schema size is capped (MAX_SCHEMA_NODES total nodes) to prevent
+schema-bomb denial-of-service attacks.
+
+Error messages never contain raw model output, duplicate key values,
+property values, or any credential/secret content.
 
 Integration note
 ----------------
@@ -45,9 +60,12 @@ from flowforge.ai.structured.exceptions import (
     ValidationPath,
 )
 from flowforge.ai.structured.types import (
+    MAX_ENUM_VALUES,
     MAX_JSON_NODES,
     MAX_NESTING_DEPTH,
     MAX_PAYLOAD_BYTES,
+    MAX_REQUIRED_FIELDS,
+    MAX_SCHEMA_NODES,
     MAX_SCHEMA_PROPERTIES,
     SUPPORTED_SCHEMA_KEYWORDS,
     SUPPORTED_TYPE_NAMES,
@@ -69,7 +87,9 @@ def validate_structured_output(
     Parameters
     ----------
     raw_text:
-        UTF-8 model response text.  Must not exceed ``MAX_PAYLOAD_BYTES``.
+        UTF-8 model response text as a plain ``str``.  Non-str values
+        (bytes, int, None, dict …) are rejected with a safe ParseError.
+        Must not exceed ``MAX_PAYLOAD_BYTES``.
         NaN/Infinity JSON literals, duplicate object keys, deeply nested
         structures and oversized payloads are all rejected.
     schema:
@@ -84,20 +104,25 @@ def validate_structured_output(
     Raises
     ------
     ParseError
-        When *raw_text* cannot be decoded as valid strict JSON.
+        When *raw_text* is not a ``str``, or cannot be decoded as valid
+        strict JSON, or contains NaN/Infinity.
     PayloadLimitError
         When payload byte size, node count or nesting depth exceeds limits.
     ValidationError
         When the parsed JSON value does not conform to *schema*.
     SchemaError
-        When *schema* uses unsupported keywords (should have been caught by
-        ``SchemaContract.from_dict()``, re-raised here as a safety net).
+        When *schema* uses unsupported keywords (re-raised as a safety net
+        in case the SchemaContract was constructed without from_dict()).
     """
+    # 0. Input type guard — string-only API
+    if not isinstance(raw_text, str):
+        raise ParseError(f"raw_text must be str, got {type(raw_text).__name__!r}")
+
     # 1. Byte-size guard — before any parsing
-    if isinstance(raw_text, str):
+    try:
         encoded = raw_text.encode("utf-8", errors="replace")
-    else:
-        encoded = bytes(raw_text)
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        raise ParseError("raw_text contains unencodable characters") from None
     if len(encoded) > MAX_PAYLOAD_BYTES:
         raise PayloadLimitError(
             f"response is {len(encoded):,} bytes; limit is {MAX_PAYLOAD_BYTES:,} bytes"
@@ -110,7 +135,10 @@ def validate_structured_output(
     _count = [0]
     _check_limits(value, depth=0, count=_count, path=ValidationPath.root())
 
-    # 4. Schema validation
+    # 4. Schema validation (re-validate schema shape as a safety net for
+    #    contracts built without from_dict)
+    _validate_schema_shape(schema.raw, depth=0, node_count=[0])
+
     root_type = schema.raw.get("type", "")
     _validate_value(value, schema.raw, path=ValidationPath.root())
 
@@ -122,15 +150,28 @@ def validate_structured_output(
 # ---------------------------------------------------------------------------
 
 
-def _validate_schema_shape(schema: Any, *, depth: int) -> None:
+def _validate_schema_shape(schema: Any, *, depth: int, node_count: list[int]) -> None:
     """Recursively verify that *schema* uses only supported keywords and types.
 
-    Raises SchemaError on the first unsupported construct found.
+    Also validates:
+    - Numeric constraints are finite, non-NaN, non-negative where applicable,
+      integral for length/item counts, and min <= max.
+    - enum is bounded (MAX_ENUM_VALUES).
+    - required is bounded (MAX_REQUIRED_FIELDS).
+    - Total schema node count is bounded (MAX_SCHEMA_NODES).
+
+    Raises SchemaError on the first unsupported or invalid construct found.
     """
     if depth > MAX_NESTING_DEPTH:
         raise SchemaError("schema nesting depth exceeds limit")
     if not isinstance(schema, dict):
         raise SchemaError(f"schema node must be a dict, got {type(schema).__name__!r}")
+
+    node_count[0] += 1
+    if node_count[0] > MAX_SCHEMA_NODES:
+        raise SchemaError(
+            f"schema has more than {MAX_SCHEMA_NODES} total nodes; simplify the schema or split it"
+        )
 
     unsupported = set(schema.keys()) - SUPPORTED_SCHEMA_KEYWORDS
     if unsupported:
@@ -148,7 +189,6 @@ def _validate_schema_shape(schema: Any, *, depth: int) -> None:
                     f"supported: {', '.join(sorted(SUPPORTED_TYPE_NAMES))}"
                 )
         elif isinstance(type_val, list):
-            # We allow union types expressed as a list of type strings
             for t in type_val:
                 if not isinstance(t, str) or t not in SUPPORTED_TYPE_NAMES:
                     raise SchemaError(
@@ -157,7 +197,8 @@ def _validate_schema_shape(schema: Any, *, depth: int) -> None:
                     )
         else:
             raise SchemaError(
-                f"schema 'type' must be a string or list of strings, got {type(type_val).__name__!r}"
+                f"schema 'type' must be a string or list of strings, "
+                f"got {type(type_val).__name__!r}"
             )
 
     if "properties" in schema:
@@ -173,12 +214,16 @@ def _validate_schema_shape(schema: Any, *, depth: int) -> None:
                 raise SchemaError(
                     f"property key must be a string, got {type(prop_name).__name__!r}"
                 )
-            _validate_schema_shape(prop_schema, depth=depth + 1)
+            _validate_schema_shape(prop_schema, depth=depth + 1, node_count=node_count)
 
     if "required" in schema:
         req = schema["required"]
         if not isinstance(req, list):
             raise SchemaError("schema 'required' must be a list")
+        if len(req) > MAX_REQUIRED_FIELDS:
+            raise SchemaError(
+                f"schema 'required' has {len(req)} entries; limit is {MAX_REQUIRED_FIELDS}"
+            )
         for item in req:
             if not isinstance(item, str):
                 raise SchemaError(f"'required' items must be strings, got {type(item).__name__!r}")
@@ -186,14 +231,13 @@ def _validate_schema_shape(schema: Any, *, depth: int) -> None:
     if "additionalProperties" in schema:
         ap = schema["additionalProperties"]
         if not isinstance(ap, bool):
-            # JSON Schema allows additionalProperties to be a schema dict
             if isinstance(ap, dict):
-                _validate_schema_shape(ap, depth=depth + 1)
+                _validate_schema_shape(ap, depth=depth + 1, node_count=node_count)
             else:
                 raise SchemaError("schema 'additionalProperties' must be a bool or schema dict")
 
     if "items" in schema:
-        _validate_schema_shape(schema["items"], depth=depth + 1)
+        _validate_schema_shape(schema["items"], depth=depth + 1, node_count=node_count)
 
     if "enum" in schema:
         enum_val = schema["enum"]
@@ -201,12 +245,75 @@ def _validate_schema_shape(schema: Any, *, depth: int) -> None:
             raise SchemaError("schema 'enum' must be a list")
         if len(enum_val) == 0:
             raise SchemaError("schema 'enum' must not be empty")
+        if len(enum_val) > MAX_ENUM_VALUES:
+            raise SchemaError(
+                f"schema 'enum' has {len(enum_val)} values; limit is {MAX_ENUM_VALUES}"
+            )
 
-    for kw in ("minLength", "maxLength", "minItems", "maxItems", "minimum", "maximum"):
+    # Validate numeric constraint keywords
+    # Length/item constraints: must be non-negative integers
+    for kw in ("minLength", "maxLength", "minItems", "maxItems"):
         if kw in schema:
-            v = schema[kw]
-            if not isinstance(v, (int, float)) or isinstance(v, bool):
-                raise SchemaError(f"schema '{kw}' must be a number, got {type(v).__name__!r}")
+            _validate_schema_integer_constraint(schema[kw], kw)
+
+    # Numeric range constraints: must be finite reals
+    for kw in ("minimum", "maximum"):
+        if kw in schema:
+            _validate_schema_numeric_constraint(schema[kw], kw)
+
+    # Cross-constraint consistency checks
+    if (
+        "minLength" in schema
+        and "maxLength" in schema
+        and schema["minLength"] > schema["maxLength"]
+    ):
+        raise SchemaError(
+            f"schema minLength ({schema['minLength']}) exceeds maxLength ({schema['maxLength']})"
+        )
+    if "minItems" in schema and "maxItems" in schema and schema["minItems"] > schema["maxItems"]:
+        raise SchemaError(
+            f"schema minItems ({schema['minItems']}) exceeds maxItems ({schema['maxItems']})"
+        )
+    if "minimum" in schema and "maximum" in schema and schema["minimum"] > schema["maximum"]:
+        raise SchemaError(
+            f"schema minimum ({schema['minimum']}) exceeds maximum ({schema['maximum']})"
+        )
+
+
+def _validate_schema_integer_constraint(value: Any, keyword: str) -> None:
+    """Validate that a length/count schema constraint is a non-negative integer."""
+    if isinstance(value, bool):
+        raise SchemaError(f"schema '{keyword}' must be a non-negative integer, got bool")
+    if not isinstance(value, (int, float)):
+        raise SchemaError(
+            f"schema '{keyword}' must be a non-negative integer, got {type(value).__name__!r}"
+        )
+    # Reject NaN and Inf
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        raise SchemaError(
+            f"schema '{keyword}' must be a finite non-negative integer, got non-finite float"
+        )
+    # Reject fractional values
+    if isinstance(value, float) and not value.is_integer():
+        raise SchemaError(
+            f"schema '{keyword}' must be an integer value, got fractional float {value!r}"
+        )
+    # Reject negative values
+    int_val = int(value)
+    if int_val < 0:
+        raise SchemaError(f"schema '{keyword}' must be non-negative, got {int_val}")
+
+
+def _validate_schema_numeric_constraint(value: Any, keyword: str) -> None:
+    """Validate that a numeric range schema constraint is a finite real number."""
+    if isinstance(value, bool):
+        raise SchemaError(f"schema '{keyword}' must be a finite number, got bool")
+    if not isinstance(value, (int, float)):
+        raise SchemaError(f"schema '{keyword}' must be a number, got {type(value).__name__!r}")
+    if math.isnan(value) or math.isinf(value):
+        raise SchemaError(
+            f"schema '{keyword}' must be a finite number, got non-finite value ({value!r})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -262,9 +369,9 @@ def _safe_parse_float(s: str) -> float:
     try:
         value = float(s)
     except ValueError:
-        raise _NaNInfError(f"invalid float literal: {s!r}") from None
+        raise _NaNInfError("invalid float literal") from None
     if math.isnan(value) or math.isinf(value):
-        raise _NaNInfError(f"non-finite number {s!r} is not allowed")
+        raise _NaNInfError("non-finite number is not allowed")
     return value
 
 
@@ -278,13 +385,18 @@ def _safe_parse_int(s: str) -> int:
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """object_pairs_hook that raises on duplicate keys."""
-    seen: dict[str, int] = {}
+    """object_pairs_hook that raises on duplicate keys.
+
+    The error message includes only the fact that a duplicate exists and
+    a safe description — it does NOT echo the key's associated values.
+    """
+    seen: set[str] = set()
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in seen:
-            raise _DuplicateKeyError(f"duplicate object key {key!r}")
-        seen[key] = 1
+            # Safe error: mention that a duplicate exists but NOT the value
+            raise _DuplicateKeyError("duplicate object key detected")
+        seen.add(key)
         result[key] = value
     return result
 
@@ -337,10 +449,10 @@ def _validate_value(value: Any, schema: dict[str, Any], *, path: ValidationPath)
                 code="TYPE_MISMATCH",
             )
 
-    # Enum
+    # Enum — strict type-sensitive comparison
     if "enum" in schema:
         allowed = schema["enum"]
-        if value not in allowed:
+        if not _enum_contains(value, allowed):
             raise ValidationError(
                 f"value is not one of the allowed enum values "
                 f"(got {_safe_type_name(value)} with {len(allowed)} choices)",
@@ -364,6 +476,24 @@ def _validate_value(value: Any, schema: dict[str, Any], *, path: ValidationPath)
     # Array
     if isinstance(value, list):
         _validate_array(value, schema, path)
+
+
+def _enum_contains(value: Any, allowed: list[Any]) -> bool:
+    """Type-sensitive enum membership check.
+
+    Python's ``in`` operator uses ``==`` which silently coerces:
+    - ``True == 1`` -> True
+    - ``False == 0`` -> True
+    - ``1 == 1.0`` -> True
+
+    This function prevents those coercions by additionally checking that
+    the JSON type of *value* matches the JSON type of each candidate.
+    """
+    value_type = _safe_type_name(value)
+    for candidate in allowed:
+        if _safe_type_name(candidate) == value_type and candidate == value:
+            return True
+    return False
 
 
 def _matches_type(value: Any, type_name: str) -> bool:
@@ -440,14 +570,14 @@ def _validate_number(value: int | float, schema: dict[str, Any], path: Validatio
     maximum = schema.get("maximum")
     if minimum is not None and value < minimum:
         raise ValidationError(
-            f"value {value} is below minimum {minimum}",
+            f"value is below minimum {minimum}",
             path=path,
             schema_type="number",
             code="NUMBER_TOO_SMALL",
         )
     if maximum is not None and value > maximum:
         raise ValidationError(
-            f"value {value} exceeds maximum {maximum}",
+            f"value exceeds maximum {maximum}",
             path=path,
             schema_type="number",
             code="NUMBER_TOO_LARGE",
@@ -477,6 +607,9 @@ def _validate_object(value: dict[str, Any], schema: dict[str, Any], path: Valida
     if additional is False:
         extra_keys = sorted(set(value.keys()) - set(properties.keys()))
         if extra_keys:
+            # Safe error: list extra key count and their names (names are from
+            # schema/data structure, not values — this is acceptable)
+            # but do NOT include the values of those keys.
             raise ValidationError(
                 f"additional properties not allowed: {', '.join(repr(k) for k in extra_keys)}",
                 path=path,

@@ -25,9 +25,12 @@ from flowforge.ai.structured.exceptions import (
     ValidationPath,
 )
 from flowforge.ai.structured.types import (
+    MAX_ENUM_VALUES,
     MAX_JSON_NODES,
     MAX_NESTING_DEPTH,
     MAX_PAYLOAD_BYTES,
+    MAX_REQUIRED_FIELDS,
+    MAX_SCHEMA_NODES,
     SUPPORTED_SCHEMA_KEYWORDS,
     SUPPORTED_TYPE_NAMES,
     SchemaContract,
@@ -52,6 +55,9 @@ __all__ = [
     "MAX_PAYLOAD_BYTES",
     "MAX_JSON_NODES",
     "MAX_NESTING_DEPTH",
+    "MAX_ENUM_VALUES",
+    "MAX_REQUIRED_FIELDS",
+    "MAX_SCHEMA_NODES",
     # Introspection
     "SUPPORTED_SCHEMA_KEYWORDS",
     "SUPPORTED_TYPE_NAMES",

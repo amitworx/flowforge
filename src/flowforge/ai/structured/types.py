@@ -7,6 +7,7 @@ and the exceptions module; no Django, Pydantic, Celery or provider code.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -56,6 +57,16 @@ MAX_NESTING_DEPTH: int = 20
 # Maximum number of object properties validated under a single schema node.
 MAX_SCHEMA_PROPERTIES: int = 200
 
+# Maximum number of values in an enum list.
+MAX_ENUM_VALUES: int = 500
+
+# Maximum number of entries in a required list.
+MAX_REQUIRED_FIELDS: int = 500
+
+# Maximum total schema nodes (properties dicts + items + all nesting) counted
+# across the whole schema tree.
+MAX_SCHEMA_NODES: int = 2_000
+
 
 # ---------------------------------------------------------------------------
 # Public result type
@@ -86,16 +97,24 @@ class SchemaContract:
     Unknown keywords cause a ``SchemaError`` to be raised before any
     model output is parsed.
 
-    Fields map 1-to-1 to JSON Schema keywords.  The ``raw`` dict is kept
-    for internal traversal and must not be mutated after construction.
+    The schema dict is defensively deep-copied at construction time so that
+    caller mutations to the original dict cannot affect validation behaviour.
+    The ``raw`` attribute is the internal snapshot and must not be mutated.
     """
 
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, schema: dict[str, Any]) -> SchemaContract:
-        """Construct and statically validate a SchemaContract from a plain dict."""
+        """Construct and statically validate a SchemaContract from a plain dict.
+
+        The *schema* dict is deep-copied before any validation so that the
+        contract is immune to later mutations of the caller's dict.
+        """
         from flowforge.ai.structured.validator import _validate_schema_shape
 
-        _validate_schema_shape(schema, depth=0)
-        return cls(raw=schema)
+        # Defensive deep copy before validation — prevents caller mutations
+        # from ever reaching the internal representation.
+        frozen_copy: dict[str, Any] = copy.deepcopy(schema)
+        _validate_schema_shape(frozen_copy, depth=0, node_count=[0])
+        return cls(raw=frozen_copy)
