@@ -66,8 +66,8 @@ _TEMPLATE_VAR_REGEX = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 
 
 def _estimate_prompt_tokens(prompt: str) -> int:
-    """Conservative prompt token estimation (roughly 1 token per 3 chars, minimum 1)."""
-    return max(1, math.ceil(len(prompt) / 3))
+    """Defensible conservative prompt token bound (at least 1 token per 2 chars, minimum 1)."""
+    return max(1, math.ceil(len(prompt) / 2))
 
 
 def _classify_provider_error_reason(exc: Exception) -> str:
@@ -493,28 +493,19 @@ def execute_step_with_schema(
                 max_output_tokens=int(max_output_tokens),
             )
 
-            # Atomic pre-call budget reservation:
-            # 1. Check call count limit
-            # 2. Check conservative token allowance (prompt tokens + max_output_tokens)
+            # True atomic pre-call budget reservation via public API:
+            reservation_id = None
             if budget_tracker:
-                if budget_tracker.calls_count + 1 > budget_tracker.max_ai_calls:
-                    raise WorkflowExecutionError(
-                        f"AI execution budget exceeded: call limit reached ({budget_tracker.calls_count}/{budget_tracker.max_ai_calls})"
-                    )
-
                 estimated_prompt_tokens = _estimate_prompt_tokens(rendered_prompt)
                 conservative_tokens = estimated_prompt_tokens + int(max_output_tokens)
-                if (
-                    budget_tracker.tokens_count + conservative_tokens
-                    > budget_tracker.max_total_tokens
-                ):
-                    raise WorkflowExecutionError(
-                        f"AI execution budget exceeded: token limit ({budget_tracker.max_total_tokens}) would be exceeded by estimated request ({conservative_tokens} tokens, current: {budget_tracker.tokens_count})"
+                try:
+                    reservation_id = budget_tracker.reserve_call(
+                        estimated_tokens=conservative_tokens
                     )
-
-                # Atomically reserve 1 call attempt upfront
-                with budget_tracker._lock:
-                    budget_tracker._calls_count += 1
+                except AISafetyError as exc:
+                    raise WorkflowExecutionError(
+                        f"AI execution budget exceeded: {exc.message}"
+                    ) from None
 
             try:
                 resp = effective_provider.generate(req)
@@ -532,19 +523,17 @@ def execute_step_with_schema(
                     safety_limits,
                 )
 
-                if budget_tracker:
-                    actual_tokens = resp.usage.total_tokens if resp.usage else 0
-                    with budget_tracker._lock:
-                        if (
-                            budget_tracker._tokens_count + actual_tokens
-                            > budget_tracker.max_total_tokens
-                        ):
-                            raise WorkflowExecutionError(
-                                f"AI execution budget exceeded: total token limit ({budget_tracker.max_total_tokens}) exceeded"
-                            )
-                        budget_tracker._tokens_count += actual_tokens
+                if budget_tracker and reservation_id:
+                    actual_tokens = (
+                        resp.usage.total_tokens
+                        if (resp.usage and resp.usage.total_tokens is not None)
+                        else None
+                    )
+                    budget_tracker.complete_call(reservation_id, actual_tokens=actual_tokens)
 
             except (AISafetyError, ProviderError, Exception) as exc:
+                if budget_tracker and reservation_id:
+                    budget_tracker.complete_call(reservation_id, actual_tokens=0, failed=True)
                 if isinstance(exc, WorkflowExecutionError):
                     raise
                 reason = _classify_provider_error_reason(exc)

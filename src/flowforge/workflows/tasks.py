@@ -323,12 +323,10 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
             WorkflowStepRun.objects.bulk_create(step_objs)
 
     except Exception as exc:
-        clean_exc = redact_secrets_from_text(sanitize_error_message(str(exc)))
         logger.error(
-            "Unexpected exception executing WorkflowRun %s: %s: %s",
+            "Unexpected exception executing WorkflowRun %s: %s (internal error code: ERR_WORKFLOW_INTERNAL_EXECUTION_FAILURE)",
             run_id,
             type(exc).__name__,
-            clean_exc,
         )
         with transaction.atomic():
             WorkflowRun.objects.filter(
