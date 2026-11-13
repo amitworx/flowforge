@@ -1,10 +1,12 @@
 import logging
+import os
 import uuid
 
 from celery import shared_task
 from django.db import models, transaction
 from django.utils import timezone
 
+from flowforge.ai.providers import OllamaProvider, OpenAICompatibleProvider
 from flowforge.processing.models import ProcessingJob
 from flowforge.workflows.engine import (
     WorkflowExecutionError,
@@ -16,6 +18,43 @@ from flowforge.workflows.models import WorkflowRun, WorkflowStepRun
 logger = logging.getLogger(__name__)
 
 GENERIC_INTERNAL_ERROR_MESSAGE = "Internal workflow execution error occurred."
+
+
+def resolve_workflow_llm_provider(step_snapshot: list[dict]):
+    """
+    Safely resolves configured LLMProvider instance from environment/admin configuration.
+    Returns None if workflow contains no LLM steps, or if LLM execution is disabled.
+    Never exposes secrets into logs or database records.
+    """
+    has_llm_step = any(
+        step.get("op") == "llm_generate" for step in step_snapshot if isinstance(step, dict)
+    )
+    if not has_llm_step:
+        return None
+
+    # Opt-in check: must have explicit environment approval
+    # e.g. FLOWFORGE_ENABLE_AI_WORKFLOW_STEPS="true"
+    ai_enabled = os.environ.get("FLOWFORGE_ENABLE_AI_WORKFLOW_STEPS", "false").lower() in (
+        "true",
+        "1",
+    )
+    if not ai_enabled:
+        return None
+
+    # Determine provider needed
+    for step in step_snapshot:
+        if step.get("op") == "llm_generate":
+            provider_type = step.get("provider")
+            if provider_type == "ollama":
+                ollama_url = os.environ.get("FLOWFORGE_OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+                return OllamaProvider(base_url=ollama_url)
+            elif provider_type == "openai":
+                api_key = os.environ.get("FLOWFORGE_OPENAI_API_KEY")
+                base_url = os.environ.get("FLOWFORGE_OPENAI_BASE_URL", "https://api.openai.com/v1")
+                if not api_key:
+                    return None
+                return OpenAICompatibleProvider(base_url=base_url, api_key=api_key)
+    return None
 
 
 @shared_task(max_retries=0)
@@ -153,9 +192,11 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
     initial_input_row_count = len(input_data)
     initial_schema = source_job.column_names or (list(input_data[0].keys()) if input_data else [])
 
+    llm_provider = resolve_workflow_llm_provider(step_snapshot)
+
     try:
         output_data, step_audits = execute_workflow_pipeline(
-            input_data, step_snapshot, schema=initial_schema
+            input_data, step_snapshot, schema=initial_schema, llm_provider=llm_provider
         )
         from flowforge.workflows.export import derive_workflow_schema
 

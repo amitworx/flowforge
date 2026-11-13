@@ -105,6 +105,10 @@ def derive_workflow_schema(initial_schema: list[str], steps: list[dict[str, Any]
         elif op == "filter_equals":
             # filter_equals does not alter the schema columns
             pass
+        elif op == "llm_generate":
+            output_col = step.get("output_column")
+            if output_col and output_col not in schema:
+                schema.append(output_col)
     return schema
 
 
