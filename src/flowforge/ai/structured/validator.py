@@ -421,8 +421,10 @@ def _check_limits(
         raise PayloadLimitError(f"document exceeds {MAX_JSON_NODES:,} JSON nodes")
 
     if isinstance(value, dict):
-        for k, v in value.items():
-            _check_limits(v, depth=depth + 1, count=count, path=path.enter(k))
+        for _k, v in value.items():
+            _check_limits(
+                v, depth=depth + 1, count=count, path=path.enter("[property]", is_safe=False)
+            )
     elif isinstance(value, list):
         for i, item in enumerate(value):
             _check_limits(item, depth=depth + 1, count=count, path=path.enter(i))
@@ -607,20 +609,29 @@ def _validate_object(value: dict[str, Any], schema: dict[str, Any], path: Valida
     if additional is False:
         extra_keys = sorted(set(value.keys()) - set(properties.keys()))
         if extra_keys:
-            # Safe error: list extra key count and their names (names are from
-            # schema/data structure, not values — this is acceptable)
-            # but do NOT include the values of those keys.
+            # Safe error: report count of unexpected properties and bounded sanitized
+            # keys without leaking arbitrary values or unbounded payload fragments.
+            safe_names = []
+            for k in extra_keys:
+                clean_k = str(k)[:30]
+                # Replace control characters
+                clean_k = "".join(ch if 32 <= ord(ch) <= 126 else "_" for ch in clean_k)
+                safe_names.append(repr(clean_k))
+            joined_names = ", ".join(safe_names[:5])
+            if len(safe_names) > 5:
+                joined_names += f" (and {len(safe_names) - 5} more)"
             raise ValidationError(
-                f"additional properties not allowed: {', '.join(repr(k) for k in extra_keys)}",
+                f"additional properties not allowed: {joined_names}",
                 path=path,
                 schema_type="object",
                 code="ADDITIONAL_PROPERTIES",
             )
     elif isinstance(additional, dict):
-        # additionalProperties is itself a schema — validate extra keys against it
+        # additionalProperties is itself a schema — validate extra keys against it.
+        # Dynamic extra keys are untrusted model output, so enter path with is_safe=False.
         extra_keys = set(value.keys()) - set(properties.keys())
         for k in sorted(extra_keys):
-            _validate_value(value[k], additional, path=path.enter(k))
+            _validate_value(value[k], additional, path=path.enter(k, is_safe=False))
 
 
 def _validate_array(value: list[Any], schema: dict[str, Any], path: ValidationPath) -> None:

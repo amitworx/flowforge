@@ -7,13 +7,54 @@ output, prompt text, API keys or credentials.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
+
+# Maximum length for an individual path segment in string representation
+MAX_PATH_SEGMENT_LEN: int = 40
+# Maximum total formatted path string length
+MAX_FORMATTED_PATH_LEN: int = 200
+
+# Pattern to check if a schema-defined property key is safe to display as-is
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_]{1,40}$")
+
+
+def _sanitize_segment(segment: str | int) -> str:
+    """Format and sanitize a single path segment for safe string representation.
+
+    - Integers are formatted as [i].
+    - Safe identifiers are formatted as .prop.
+    - Control characters, extreme unicode, or long/unsafe strings are sanitized
+      to a safe, bounded representation without leaking arbitrary model contents.
+    """
+    if isinstance(segment, int):
+        return f"[{segment}]"
+
+    seg_str = str(segment)
+    if _SAFE_IDENTIFIER_RE.match(seg_str):
+        return f".{seg_str}"
+
+    # Generic or dynamic placeholders
+    if seg_str.startswith("[") and seg_str.endswith("]"):
+        safe_inner = re.sub(r"[^\w\-]", "", seg_str[1:-1])[:20]
+        return f"[{safe_inner}]"
+
+    # For other strings, escape non-printable and truncate
+    clean = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", seg_str)
+    clean = re.sub(r"[^\w\-.]", "_", clean)[:MAX_PATH_SEGMENT_LEN]
+    if not clean:
+        clean = "property"
+    return f".{clean}"
 
 
 @dataclass(frozen=True)
 class ValidationPath:
-    """Represents a JSON path in a validated document."""
+    """Represents a JSON path in a validated document.
+
+    Only schema-defined properties or safe generic placeholders should be entered.
+    Arbitrary model-controlled keys must use safe placeholders (like '[property]').
+    """
 
     parts: tuple[str | int, ...] = field(default_factory=tuple)
 
@@ -21,19 +62,30 @@ class ValidationPath:
     def root(cls) -> ValidationPath:
         return cls(parts=())
 
-    def enter(self, key: str | int) -> ValidationPath:
-        return ValidationPath(parts=(*self.parts, key))
+    def enter(self, key: str | int, *, is_safe: bool = True) -> ValidationPath:
+        """Enter a path segment.
+
+        If `is_safe` is False, the key is replaced with the generic placeholder
+        `'[property]'` so untrusted model key names are never stored or leaked.
+        """
+        if not is_safe:
+            part: str | int = "[property]"
+        else:
+            if isinstance(key, int):
+                part = key
+            else:
+                clean = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", str(key))[:MAX_PATH_SEGMENT_LEN]
+                part = clean if clean else "[property]"
+        return ValidationPath(parts=(*self.parts, part))
 
     def __str__(self) -> str:
         if not self.parts:
             return "$"
-        segments = []
-        for part in self.parts:
-            if isinstance(part, int):
-                segments.append(f"[{part}]")
-            else:
-                segments.append(f".{part}")
-        return "$" + "".join(segments)
+        segments = [_sanitize_segment(p) for p in self.parts]
+        formatted = "$" + "".join(segments)
+        if len(formatted) > MAX_FORMATTED_PATH_LEN:
+            return formatted[: MAX_FORMATTED_PATH_LEN - 3] + "..."
+        return formatted
 
 
 class StructuredOutputError(ValueError):
