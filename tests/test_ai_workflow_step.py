@@ -82,6 +82,7 @@ def test_allowed_operations_includes_llm_generate():
         "system_instruction",
         "max_output_tokens",
         "temperature",
+        "output_schema",
     }
 
 
