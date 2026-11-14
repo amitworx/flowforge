@@ -65,9 +65,27 @@ ALLOWED_LLM_PROVIDERS = {"ollama", "openai"}
 _TEMPLATE_VAR_REGEX = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 
 
-def _estimate_prompt_tokens(prompt: str) -> int:
-    """Defensible conservative prompt token bound (at least 1 token per 2 chars, minimum 1)."""
-    return max(1, math.ceil(len(prompt) / 2))
+def _estimate_prompt_tokens(prompt: str, system_instruction: str | None = None) -> int:
+    """Enforceable conservative prompt token bound.
+
+    Accounts for:
+    - User prompt character length (conservative 1 token per 2 chars)
+    - Multi-byte UTF-8 bytes (non-ASCII characters tokenize to multiple tokens)
+    - System instruction content + message framing overhead (~10 tokens)
+    """
+    prompt_bytes = len(prompt.encode("utf-8"))
+    prompt_char_estimate = math.ceil(len(prompt) / 2)
+    prompt_byte_estimate = math.ceil(prompt_bytes / 2)
+    base_user_tokens = max(1, max(prompt_char_estimate, prompt_byte_estimate))
+
+    system_tokens = 0
+    if system_instruction:
+        sys_bytes = len(system_instruction.encode("utf-8"))
+        sys_char_est = math.ceil(len(system_instruction) / 2)
+        sys_byte_est = math.ceil(sys_bytes / 2)
+        system_tokens = max(sys_char_est, sys_byte_est) + 10  # include framing overhead
+
+    return base_user_tokens + system_tokens
 
 
 def _classify_provider_error_reason(exc: Exception) -> str:
@@ -495,8 +513,11 @@ def execute_step_with_schema(
 
             # True atomic pre-call budget reservation via public API:
             reservation_id = None
+            estimated_prompt_tokens = 0
             if budget_tracker:
-                estimated_prompt_tokens = _estimate_prompt_tokens(rendered_prompt)
+                estimated_prompt_tokens = _estimate_prompt_tokens(
+                    rendered_prompt, system_instruction=system_instruction
+                )
                 conservative_tokens = estimated_prompt_tokens + int(max_output_tokens)
                 try:
                     reservation_id = budget_tracker.reserve_call(
@@ -533,7 +554,13 @@ def execute_step_with_schema(
 
             except (AISafetyError, ProviderError, Exception) as exc:
                 if budget_tracker and reservation_id:
-                    budget_tracker.complete_call(reservation_id, actual_tokens=0, failed=True)
+                    # Distinguish 'not sent' vs 'may have been sent'.
+                    # When a ProviderError/Exception occurred during generate(), remote server
+                    # may have processed the prompt. Retain conservative prompt token exposure.
+                    prompt_tokens_exposure = max(1, estimated_prompt_tokens)
+                    budget_tracker.complete_call(
+                        reservation_id, actual_tokens=prompt_tokens_exposure, failed=True
+                    )
                 if isinstance(exc, WorkflowExecutionError):
                     raise
                 reason = _classify_provider_error_reason(exc)

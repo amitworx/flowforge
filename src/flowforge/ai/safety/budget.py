@@ -100,8 +100,9 @@ class ExecutionBudgetTracker:
     ) -> None:
         """Complete a reserved AI call, reconciling actual tokens used.
 
-        - If failed=True and actual_tokens is None/0, reserved tokens are released, but the 1 call attempt remains consumed.
-        - If actual_tokens is None, conservative estimation from reservation is retained.
+        - If reservation_id is not in active reservations, raises AIConfigurationError fail-closed.
+        - If adding final tokens exceeds max_total_tokens, raises AIPolicyLimitError fail-closed and preserves limit.
+        - If failed=True and actual_tokens is None or 0, retains 0 tokens if not sent, or retains conservative usage.
         - Actual tokens replace the reserved tokens under lock without double counting calls or allowing negative decrements.
         """
         if actual_tokens is not None:
@@ -111,7 +112,12 @@ class ExecutionBudgetTracker:
                 raise AIConfigurationError("actual_tokens must be a non-negative integer")
 
         with self._lock:
-            reserved = self._reservations.pop(reservation_id, 0)
+            if reservation_id not in self._reservations:
+                raise AIConfigurationError(
+                    f"Unknown or duplicate reservation_id '{reservation_id}'"
+                )
+
+            reserved = self._reservations.pop(reservation_id)
             self._reserved_tokens = max(0, self._reserved_tokens - reserved)
 
             if failed and (actual_tokens is None or actual_tokens == 0):
@@ -120,6 +126,16 @@ class ExecutionBudgetTracker:
 
             # Determine final tokens to record
             final_tokens = actual_tokens if actual_tokens is not None else reserved
+            if self._tokens_count + final_tokens > self.max_total_tokens:
+                # Token overrun on reconciliation: record up to max_total_tokens or raise
+                self._tokens_count = min(self.max_total_tokens, self._tokens_count + final_tokens)
+                raise AIPolicyLimitError(
+                    f"Workflow AI total token limit ({self.max_total_tokens} tokens) exceeded on completion with {final_tokens} tokens",
+                    limit_name="max_total_tokens",
+                    actual_value=self._tokens_count,
+                    limit_value=self.max_total_tokens,
+                )
+
             self._tokens_count += final_tokens
 
     def record_call(self, tokens_used: int = 0) -> None:
@@ -146,11 +162,11 @@ class ExecutionBudgetTracker:
                     limit_value=self.max_ai_calls,
                 )
 
-            if self._tokens_count + tokens_used > self.max_total_tokens:
+            if self._tokens_count + self._reserved_tokens + tokens_used > self.max_total_tokens:
                 raise AIPolicyLimitError(
                     f"Workflow AI total token limit ({self.max_total_tokens} tokens) exceeded",
                     limit_name="max_total_tokens",
-                    actual_value=self._tokens_count + tokens_used,
+                    actual_value=self._tokens_count + self._reserved_tokens + tokens_used,
                     limit_value=self.max_total_tokens,
                 )
 
