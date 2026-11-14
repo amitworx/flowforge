@@ -402,6 +402,25 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Path helper for safe traversal within validator
+# ---------------------------------------------------------------------------
+
+
+def _enter_path(path: ValidationPath, segment: str | int) -> ValidationPath:
+    """Enter a path segment safely within the validator.
+
+    - Integer segments represent array indices and are preserved as numeric indices.
+    - String segments represent object properties and are ALWAYS entered with
+      `is_safe=False` (yielding the generic opaque placeholder '[property]'),
+      ensuring that caller-controlled schema property names and model keys cannot
+      leak into error paths, even if the public ValidationPath.enter default is True.
+    """
+    if isinstance(segment, int):
+        return path.enter(segment)
+    return path.enter(segment, is_safe=False)
+
+
+# ---------------------------------------------------------------------------
 # Payload limit checks (depth and node count)
 # ---------------------------------------------------------------------------
 
@@ -422,12 +441,10 @@ def _check_limits(
 
     if isinstance(value, dict):
         for _k, v in value.items():
-            _check_limits(
-                v, depth=depth + 1, count=count, path=path.enter("[property]", is_safe=False)
-            )
+            _check_limits(v, depth=depth + 1, count=count, path=_enter_path(path, "[property]"))
     elif isinstance(value, list):
         for i, item in enumerate(value):
-            _check_limits(item, depth=depth + 1, count=count, path=path.enter(i))
+            _check_limits(item, depth=depth + 1, count=count, path=_enter_path(path, i))
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +624,7 @@ def _validate_object(value: dict[str, Any], schema: dict[str, Any], path: Valida
     properties = schema.get("properties", {})
     for prop_name, prop_schema in properties.items():
         if prop_name in value:
-            _validate_value(value[prop_name], prop_schema, path=path.enter(prop_name))
+            _validate_value(value[prop_name], prop_schema, path=_enter_path(path, prop_name))
 
     # Additional properties
     additional = schema.get("additionalProperties")
@@ -626,10 +643,10 @@ def _validate_object(value: dict[str, Any], schema: dict[str, Any], path: Valida
             )
     elif isinstance(additional, dict):
         # additionalProperties is itself a schema — validate extra keys against it.
-        # Dynamic extra keys are untrusted model output, so enter path with is_safe=False.
+        # Dynamic extra keys are untrusted model output, so enter path safely with is_safe=False.
         extra_keys = set(value.keys()) - set(properties.keys())
         for k in sorted(extra_keys):
-            _validate_value(value[k], additional, path=path.enter(k, is_safe=False))
+            _validate_value(value[k], additional, path=_enter_path(path, k))
 
 
 def _validate_array(value: list[Any], schema: dict[str, Any], path: ValidationPath) -> None:
@@ -653,4 +670,4 @@ def _validate_array(value: list[Any], schema: dict[str, Any], path: ValidationPa
     items_schema = schema.get("items")
     if items_schema is not None:
         for i, item in enumerate(value):
-            _validate_value(item, items_schema, path=path.enter(i))
+            _validate_value(item, items_schema, path=_enter_path(path, i))

@@ -415,7 +415,8 @@ class TestObjectValidation:
         with pytest.raises(ValidationError) as exc_info:
             _validate('{"count": "not-an-int"}', schema)
         err = exc_info.value
-        assert "count" in str(err.path)
+        assert "count" not in str(err.path)
+        assert str(err.path) == "$[property]"
         assert err.code == "TYPE_MISMATCH"
 
     def test_nested_required_fields(self):
@@ -432,7 +433,8 @@ class TestObjectValidation:
         with pytest.raises(ValidationError) as exc_info:
             _validate('{"address": {}}', schema)
         err = exc_info.value
-        assert "address" in str(err.path)
+        assert "address" not in str(err.path)
+        assert str(err.path) == "$[property]"
         assert err.code == "MISSING_REQUIRED"
 
     def test_additional_properties_false_rejects_extras(self):
@@ -662,7 +664,8 @@ class TestValidationErrorMetadata:
         d = exc_info.value.as_dict()
         assert set(d.keys()) == {"code", "path", "schema_type", "message"}
         assert d["code"] == "TYPE_MISMATCH"
-        assert "$.x" in d["path"]
+        assert d["path"] == "$[property]"
+        assert "x" not in d["path"]
 
     def test_path_formatting_root(self):
         with pytest.raises(ValidationError) as exc_info:
@@ -682,8 +685,9 @@ class TestValidationErrorMetadata:
         with pytest.raises(ValidationError) as exc_info:
             _validate('{"user": {"age": "old"}}', schema)
         path_str = str(exc_info.value.path)
-        assert "user" in path_str
-        assert "age" in path_str
+        assert "user" not in path_str
+        assert "age" not in path_str
+        assert path_str == "$[property][property]"
 
 
 # ===========================================================================

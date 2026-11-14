@@ -285,7 +285,8 @@ class TestAbsentRequiredFields:
         with pytest.raises(ValidationError) as exc_info:
             _validate('{"level1": {}}', schema)
         err = exc_info.value
-        assert "level1" in str(err.path)
+        assert "level1" not in str(err.path)
+        assert "[property]" in str(err.path)
         assert err.code == "MISSING_REQUIRED"
 
 
@@ -484,7 +485,8 @@ class TestDeterminism:
         for _ in range(5):
             with pytest.raises(ValidationError) as exc_info:
                 _validate('{"x": "not_int"}', schema)
-            assert "$.x" in str(exc_info.value.path)
+            assert str(exc_info.value.path) == "$[property]"
+            assert "x" not in str(exc_info.value.path)
 
     def test_error_as_dict_is_deterministically_ordered(self):
         """as_dict() must have a stable key order."""

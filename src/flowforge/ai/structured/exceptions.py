@@ -65,8 +65,10 @@ class ValidationPath:
     def enter(self, key: str | int, *, is_safe: bool = True) -> ValidationPath:
         """Enter a path segment.
 
-        If `is_safe` is False, the key is replaced with the generic placeholder
-        `'[property]'` so untrusted model key names are never stored or leaked.
+        Public default is `is_safe=True` for backward compatibility with manual/external
+        path construction. However, validator implementations must ALWAYS pass
+        `is_safe=False` (or use `enter_property`) for any schema-defined property key or
+        dynamic model key, so untrusted names are never stored or leaked.
         """
         if not is_safe:
             part: str | int = "[property]"
@@ -77,6 +79,14 @@ class ValidationPath:
                 clean = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", str(key))[:MAX_PATH_SEGMENT_LEN]
                 part = clean if clean else "[property]"
         return ValidationPath(parts=(*self.parts, part))
+
+    def enter_property(self, key: str = "[property]") -> ValidationPath:
+        """Enter an object property segment using an opaque generic placeholder.
+
+        Always forces `is_safe=False` so untrusted caller-supplied schema property
+        names and model output keys are never stored or leaked.
+        """
+        return self.enter(key, is_safe=False)
 
     def __str__(self) -> str:
         if not self.parts:

@@ -156,9 +156,9 @@ class TestErrorPathSanitizationRED:
             assert part != secret_key
             assert secret_key not in str(part)
 
-    def test_safe_schema_defined_properties_are_preserved(self):
-        """Safe property names defined in the schema SHOULD be preserved in path,
-        allowing callers to locate schema violations."""
+    def test_schema_defined_properties_use_generic_path_in_validator(self):
+        """Schema property names must NOT leak into path representations during validation;
+        they must use generic opaque placeholders."""
         schema = {
             "type": "object",
             "properties": {
@@ -178,8 +178,11 @@ class TestErrorPathSanitizationRED:
             _validate(payload, schema)
 
         err = exc_info.value
-        assert str(err.path) == "$.user.profile.age"
-        assert err.as_dict()["path"] == "$.user.profile.age"
+        assert str(err.path) == "$[property][property][property]"
+        assert err.as_dict()["path"] == "$[property][property][property]"
+        assert "user" not in str(err.path)
+        assert "profile" not in str(err.path)
+        assert "age" not in str(err.path)
 
     def test_schema_defined_property_with_control_chars_is_sanitized_in_path(self):
         """Even if a schema property name has special/control chars, path formatting
