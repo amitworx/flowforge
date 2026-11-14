@@ -66,17 +66,22 @@ _TEMPLATE_VAR_REGEX = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 
 
 def _estimate_prompt_tokens(prompt: str, system_instruction: str | None = None) -> int:
-    """Enforceable conservative prompt token bound.
+    """Internal conservative token estimation heuristic.
 
-    Accounts for:
+    NOTE: This is a conservative heuristic used for pre-call budget checks, NOT a
+    tokenizer-independent strict upper bound across arbitrary model tokenizers.
+    Hard pre-call token guarantees are impossible without model-specific tokenizers.
+
+    Heuristic breakdown:
     - User prompt character length (conservative 1 token per 2 chars)
-    - Multi-byte UTF-8 bytes (non-ASCII characters tokenize to multiple tokens)
-    - System instruction content + message framing overhead (~10 tokens)
+    - Multi-byte UTF-8 byte count (ceil(bytes / 2)) to prevent under-estimating non-ASCII text
+    - User message framing overhead (~4 tokens)
+    - System instruction content + system message framing overhead (~10 tokens)
     """
     prompt_bytes = len(prompt.encode("utf-8"))
     prompt_char_estimate = math.ceil(len(prompt) / 2)
     prompt_byte_estimate = math.ceil(prompt_bytes / 2)
-    base_user_tokens = max(1, max(prompt_char_estimate, prompt_byte_estimate))
+    base_user_tokens = max(1, max(prompt_char_estimate, prompt_byte_estimate)) + 4
 
     system_tokens = 0
     if system_instruction:
@@ -554,12 +559,13 @@ def execute_step_with_schema(
 
             except (AISafetyError, ProviderError, Exception) as exc:
                 if budget_tracker and reservation_id:
-                    # Distinguish 'not sent' vs 'may have been sent'.
-                    # When a ProviderError/Exception occurred during generate(), remote server
-                    # may have processed the prompt. Retain conservative prompt token exposure.
-                    prompt_tokens_exposure = max(1, estimated_prompt_tokens)
+                    # Distinguish 'not sent' (pre-network rejection) vs 'maybe-sent' provider error.
+                    # When a ProviderError/Exception occurred during or after generate(), the remote
+                    # provider may have processed both prompt and completion tokens before failing/timing out.
+                    # Retain full reserved exposure (prompt + max_output_tokens) so external spend is
+                    # not underreported when actual usage is unknown.
                     budget_tracker.complete_call(
-                        reservation_id, actual_tokens=prompt_tokens_exposure, failed=True
+                        reservation_id, actual_tokens=conservative_tokens, failed=True
                     )
                 if isinstance(exc, WorkflowExecutionError):
                     raise

@@ -48,6 +48,18 @@ class ExecutionBudgetTracker:
             return self._reserved_tokens
 
     @property
+    def has_overrun(self) -> bool:
+        """Returns True if recorded token usage has exceeded max_total_tokens."""
+        with self._lock:
+            return self._tokens_count > self.max_total_tokens
+
+    @property
+    def tokens_overrun(self) -> int:
+        """Returns the number of tokens recorded beyond max_total_tokens, or 0 if within limit."""
+        with self._lock:
+            return max(0, self._tokens_count - self.max_total_tokens)
+
+    @property
     def effective_tokens_count(self) -> int:
         with self._lock:
             return self._tokens_count + self._reserved_tokens
@@ -126,17 +138,16 @@ class ExecutionBudgetTracker:
 
             # Determine final tokens to record
             final_tokens = actual_tokens if actual_tokens is not None else reserved
-            if self._tokens_count + final_tokens > self.max_total_tokens:
-                # Token overrun on reconciliation: record up to max_total_tokens or raise
-                self._tokens_count = min(self.max_total_tokens, self._tokens_count + final_tokens)
+            # Accurately record actual token usage to prevent silently underreporting external spend
+            self._tokens_count += final_tokens
+
+            if self._tokens_count > self.max_total_tokens:
                 raise AIPolicyLimitError(
-                    f"Workflow AI total token limit ({self.max_total_tokens} tokens) exceeded on completion with {final_tokens} tokens",
+                    f"Workflow AI total token limit ({self.max_total_tokens} tokens) exceeded on completion with {final_tokens} tokens (total used: {self._tokens_count})",
                     limit_name="max_total_tokens",
                     actual_value=self._tokens_count,
                     limit_value=self.max_total_tokens,
                 )
-
-            self._tokens_count += final_tokens
 
     def record_call(self, tokens_used: int = 0) -> None:
         """Record an AI call and its token consumption against the budget.

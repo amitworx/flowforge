@@ -47,7 +47,7 @@ class MockLLMProvider(LLMProvider):
 
 
 def test_complete_call_fails_closed_when_actual_tokens_exceed_max_total():
-    """If actual_tokens > reserved and total exceeds max_total_tokens, must raise AIPolicyLimitError and not overcommit."""
+    """If actual_tokens > reserved and total exceeds max_total_tokens, must raise AIPolicyLimitError and accurately record overrun."""
     tracker = ExecutionBudgetTracker(max_ai_calls=5, max_total_tokens=100)
     res_id = tracker.reserve_call(estimated_tokens=10)
 
@@ -55,8 +55,10 @@ def test_complete_call_fails_closed_when_actual_tokens_exceed_max_total():
     with pytest.raises(AIPolicyLimitError, match="total token limit"):
         tracker.complete_call(res_id, actual_tokens=120)
 
-    # Tracker state must not record tokens beyond limit
-    assert tracker.tokens_count <= 100
+    # Tracker accurately records actual usage (120) and flags overrun, never silently underreporting spend
+    assert tracker.tokens_count == 120
+    assert tracker.has_overrun is True
+    assert tracker.tokens_overrun == 20
 
 
 def test_complete_call_rejects_unknown_or_duplicate_reservation_id():
