@@ -73,8 +73,7 @@ def sanitize_csv_cell(value: Any) -> str:
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return str(value)
-
-    s = str(value)
+    s = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
 
     # Scan past any leading whitespace, control, or formatting characters
     idx = 0

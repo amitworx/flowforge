@@ -56,6 +56,7 @@ STEP_ALLOWED_FIELDS = {
         "system_instruction",
         "max_output_tokens",
         "temperature",
+        "output_schema",
     },
 }
 
@@ -321,6 +322,27 @@ def validate_step_definitions(steps: Any) -> list[dict[str, Any]]:
                         f"Step {idx} (llm_generate): 'temperature' must be a float between 0.0 and 2.0."
                     )
 
+            if "output_schema" in step:
+                raw_schema = step.get("output_schema")
+                if not isinstance(raw_schema, dict):
+                    raise WorkflowExecutionError(
+                        f"Step {idx} (llm_generate): 'output_schema' must be a dictionary representing a JSON schema."
+                    )
+                try:
+                    from flowforge.ai.structured import SchemaContract
+                    from flowforge.ai.structured.exceptions import StructuredOutputError
+
+                    SchemaContract.from_dict(raw_schema)
+                except StructuredOutputError as exc:
+                    safe_msg = redact_secrets_from_text(str(exc))
+                    raise WorkflowExecutionError(
+                        f"Step {idx} (llm_generate): Invalid output_schema: {safe_msg}"
+                    ) from None
+                except Exception:
+                    raise WorkflowExecutionError(
+                        f"Step {idx} (llm_generate): Invalid output_schema configuration."
+                    ) from None
+
         validated.append(step)
     return validated
 
@@ -479,6 +501,12 @@ def execute_step_with_schema(
         max_output_tokens = step.get("max_output_tokens", 1024)
         temperature = step.get("temperature", 0.7)
 
+        output_schema_contract = None
+        if "output_schema" in step and step["output_schema"] is not None:
+            from flowforge.ai.structured import SchemaContract
+
+            output_schema_contract = SchemaContract.from_dict(step["output_schema"])
+
         safety_limits = SafetyLimits(
             max_output_tokens=max_output_tokens,
             max_workflow_ai_calls=MAX_AI_ROWS_PER_WORKFLOW,
@@ -590,6 +618,32 @@ def execute_step_with_schema(
                         )
                     raise
 
+                final_output_val: Any = sanitized_output
+                if output_schema_contract is not None:
+                    from flowforge.ai.structured import validate_structured_output
+                    from flowforge.ai.structured.exceptions import StructuredOutputError
+
+                    try:
+                        validated_res = validate_structured_output(
+                            resp_content, output_schema_contract
+                        )
+                        final_output_val = validated_res.value
+                    except StructuredOutputError as exc:
+                        if budget_tracker and reservation_id and not reservation_finalized:
+                            reservation_finalized = True
+                            tokens_to_charge = (
+                                known_actual_tokens
+                                if known_actual_tokens is not None
+                                else conservative_tokens
+                            )
+                            budget_tracker.complete_call(
+                                reservation_id, actual_tokens=tokens_to_charge, failed=True
+                            )
+                        safe_reason = redact_secrets_from_text(str(exc))
+                        raise WorkflowExecutionError(
+                            f"Structured output validation failed: {safe_reason}"
+                        ) from None
+
                 # Finalize reservation on successful processing
                 if budget_tracker and reservation_id and not reservation_finalized:
                     reservation_finalized = True
@@ -612,7 +666,7 @@ def execute_step_with_schema(
                 raise WorkflowExecutionError(f"LLM generation failed: {reason}") from None
 
             new_row = dict(row)
-            new_row[output_col] = sanitized_output
+            new_row[output_col] = final_output_val
             new_data.append(new_row)
 
         return new_data, new_schema
