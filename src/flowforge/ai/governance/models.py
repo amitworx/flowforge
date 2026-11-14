@@ -14,6 +14,45 @@ from typing import Any
 
 from flowforge.ai.governance.exceptions import AIGovernanceError
 
+ALLOWED_AUDIT_METADATA_KEYS = frozenset(
+    {
+        "job_id",
+        "step_name",
+        "workflow_id",
+        "run_id",
+        "tenant_id",
+        "user_id",
+        "correlation_id",
+        "attempt",
+        "provider",
+        "model",
+        "status",
+        "reason",
+        "client_version",
+    }
+)
+
+
+def sanitize_audit_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str]:
+    """Sanitizes audit metadata by allowlisting permitted bounded keys and casting values to strings.
+
+    Strips any raw prompts, authorization headers, api keys, or sensitive fields.
+    """
+    if not metadata:
+        return {}
+    clean: dict[str, str] = {}
+    for k, v in metadata.items():
+        key_str = str(k).lower().strip()
+        if key_str in ALLOWED_AUDIT_METADATA_KEYS and v is not None:
+            # Bound value string length to 256 chars max
+            val_str = str(v)[:256]
+            # Extra safety: reject obvious secret indicators
+            lower_val = val_str.lower()
+            if "bearer " in lower_val or "sk-" in lower_val or "secret" in lower_val:
+                continue
+            clean[key_str] = val_str
+    return clean
+
 
 class BudgetScopeType(StrEnum):
     """Scope boundaries for budget allocation and accounting."""
@@ -69,6 +108,27 @@ class BudgetScope:
         if self.provider is not None:
             parts.append(f"provider={self.provider}")
         return ":".join(parts)
+
+    def get_ancestor_scopes(self) -> list[BudgetScope]:
+        """Returns the list of ancestor scopes in top-down order (GLOBAL -> TENANT -> WORKFLOW -> RUN/PROVIDER)."""
+        ancestors: list[BudgetScope] = [BudgetScope(scope_type=BudgetScopeType.GLOBAL)]
+        if self.tenant_id:
+            tenant_s = BudgetScope(scope_type=BudgetScopeType.TENANT, tenant_id=self.tenant_id)
+            if self.scope_type != BudgetScopeType.TENANT:
+                ancestors.append(tenant_s)
+
+            if self.workflow_id and self.scope_type not in (
+                BudgetScopeType.TENANT,
+                BudgetScopeType.WORKFLOW,
+            ):
+                ancestors.append(
+                    BudgetScope(
+                        scope_type=BudgetScopeType.WORKFLOW,
+                        tenant_id=self.tenant_id,
+                        workflow_id=self.workflow_id,
+                    )
+                )
+        return ancestors
 
 
 @dataclass(frozen=True)
@@ -166,7 +226,7 @@ class ReservationRecord:
     status: ReservationStatus
     created_at: datetime.datetime
     expires_at: datetime.datetime | None = None
-    audit_metadata: Mapping[str, Any] = field(default_factory=dict)
+    audit_metadata: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.reservation_id:
@@ -177,6 +237,7 @@ class ReservationRecord:
             raise AIGovernanceError("attempt_number must be >= 1")
         if self.created_at.tzinfo is None:
             raise AIGovernanceError("created_at must be timezone-aware (UTC)")
+        object.__setattr__(self, "audit_metadata", sanitize_audit_metadata(self.audit_metadata))
 
 
 @dataclass(frozen=True)
@@ -200,7 +261,7 @@ class SettlementRecord:
     overrun_tokens: int = 0
     overrun_cost_micros: int = 0
     duration_seconds: float = 0.0
-    audit_metadata: Mapping[str, Any] = field(default_factory=dict)
+    audit_metadata: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.settlement_id:
@@ -209,6 +270,23 @@ class SettlementRecord:
             raise AIGovernanceError("reservation_id cannot be empty")
         if self.settled_at.tzinfo is None:
             raise AIGovernanceError("settled_at must be timezone-aware (UTC)")
+        for name, val in [
+            ("actual_prompt_tokens", self.actual_prompt_tokens),
+            ("actual_completion_tokens", self.actual_completion_tokens),
+            ("actual_total_tokens", self.actual_total_tokens),
+            ("actual_cost_micros", self.actual_cost_micros),
+            ("overrun_tokens", self.overrun_tokens),
+            ("overrun_cost_micros", self.overrun_cost_micros),
+        ]:
+            if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+                raise AIGovernanceError(f"{name} must be a non-negative integer")
+        if (
+            isinstance(self.duration_seconds, bool)
+            or not isinstance(self.duration_seconds, (int, float))
+            or self.duration_seconds < 0
+        ):
+            raise AIGovernanceError("duration_seconds must be a non-negative float")
+        object.__setattr__(self, "audit_metadata", sanitize_audit_metadata(self.audit_metadata))
 
 
 @dataclass(frozen=True)
@@ -227,8 +305,9 @@ class UsageLedgerEntry:
     calls_delta: int
     overrun_marker: OverrunMarker = OverrunMarker.NONE
     notes: str = ""
-    audit_metadata: Mapping[str, Any] = field(default_factory=dict)
+    audit_metadata: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.timestamp.tzinfo is None:
             raise AIGovernanceError("timestamp must be timezone-aware (UTC)")
+        object.__setattr__(self, "audit_metadata", sanitize_audit_metadata(self.audit_metadata))

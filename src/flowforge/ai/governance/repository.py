@@ -49,8 +49,39 @@ class BudgetRepository(Protocol):
         """Retrieve reservation record by its unique reservation_id."""
         ...
 
-    def get_reservation_by_idempotency_key(self, idempotency_key: str) -> ReservationRecord | None:
-        """Retrieve reservation record by its client-supplied idempotency key."""
+    def get_reservation_by_idempotency_key(
+        self, idempotency_key: str, scope: BudgetScope | None = None
+    ) -> ReservationRecord | None:
+        """Retrieve reservation record by its client-supplied idempotency key, optionally scoped."""
+        ...
+
+    def reserve_atomic(
+        self,
+        *,
+        reservation_id: str,
+        idempotency_key: str,
+        scope: BudgetScope,
+        ancestor_scopes: list[BudgetScope],
+        provider: str,
+        model: str,
+        estimated_prompt_tokens: int,
+        estimated_completion_tokens: int,
+        estimated_total_tokens: int,
+        estimated_cost_micros: int,
+        attempt_number: int,
+        created_at: datetime.datetime,
+        expires_at: datetime.datetime | None = None,
+        audit_metadata: Mapping[str, Any] | None = None,
+        ledger_entry: UsageLedgerEntry | None = None,
+    ) -> tuple[ReservationRecord, bool]:  # (record, is_replayed)
+        """Atomically checks all budget limits across scope and ancestors, creates reservation,
+
+        and optionally records ledger entry under a single lock/transaction.
+        If idempotency_key matches an existing reservation in this scope with identical parameters,
+        returns (existing_record, True). If parameters conflict or cross-tenant key reuse is attempted,
+        raises AIDuplicateSettlementError.
+        If limits exceeded, raises AIBudgetExhaustedError fail-closed without mutating counters.
+        """
         ...
 
     def create_reservation(
@@ -70,19 +101,16 @@ class BudgetRepository(Protocol):
         expires_at: datetime.datetime | None = None,
         audit_metadata: Mapping[str, Any] | None = None,
     ) -> ReservationRecord:
-        """Atomically create a reservation under lock.
-
-        If idempotency_key already exists:
-        - If parameters match, return existing ReservationRecord (idempotent replay).
-        - If parameters conflict, raise AIDuplicateSettlementError or AIGovernanceError.
-        """
+        """Create a reservation record directly."""
         ...
 
     def get_settlement_by_id(self, settlement_id: str) -> SettlementRecord | None:
         """Retrieve settlement record by settlement_id."""
         ...
 
-    def get_settlement_by_idempotency_key(self, idempotency_key: str) -> SettlementRecord | None:
+    def get_settlement_by_idempotency_key(
+        self, idempotency_key: str, scope: BudgetScope | None = None
+    ) -> SettlementRecord | None:
         """Retrieve settlement record by idempotency_key."""
         ...
 
@@ -108,15 +136,16 @@ class BudgetRepository(Protocol):
         overrun_cost_micros: int = 0,
         duration_seconds: float = 0.0,
         audit_metadata: Mapping[str, Any] | None = None,
-    ) -> SettlementRecord:
-        """Atomically settle a pending reservation.
+        ledger_entry: UsageLedgerEntry | None = None,
+    ) -> tuple[SettlementRecord, bool]:  # (record, is_replayed)
+        """Atomically settle a pending reservation and optionally append ledger entry.
 
         Transitions reservation from PENDING -> SETTLED.
         Deducts reserved allowance and increments settled usage.
         Guarantees exactly-once settlement:
-        - If already settled with same idempotency_key and parameters, returns existing SettlementRecord.
+        - If already settled with same idempotency_key and parameters, returns (existing, True).
         - If already settled with conflicting parameters, raises AIDuplicateSettlementError.
-        - If attempt_number is less than reservation's attempt_number, raises AIStaleFencedAttemptError.
+        - If attempt_number does not match reservation's attempt_number, raises AIStaleFencedAttemptError.
         """
         ...
 
@@ -127,7 +156,8 @@ class BudgetRepository(Protocol):
         idempotency_key: str,
         released_at: datetime.datetime,
         reason: str = "Released without usage",
-    ) -> ReservationRecord:
+        ledger_entry: UsageLedgerEntry | None = None,
+    ) -> tuple[ReservationRecord, bool]:  # (record, is_replayed)
         """Release a pending reservation without charging actual usage.
 
         Transitions reservation PENDING -> RELEASED.
