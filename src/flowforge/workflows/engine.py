@@ -519,6 +519,7 @@ def execute_step_with_schema(
             # True atomic pre-call budget reservation via public API:
             reservation_id = None
             estimated_prompt_tokens = 0
+            conservative_tokens = 0
             if budget_tracker:
                 estimated_prompt_tokens = _estimate_prompt_tokens(
                     rendered_prompt, system_instruction=system_instruction
@@ -533,8 +534,32 @@ def execute_step_with_schema(
                         f"AI execution budget exceeded: {exc.message}"
                     ) from None
 
+            resp = None
+            reservation_finalized = False
             try:
-                resp = effective_provider.generate(req)
+                try:
+                    resp = effective_provider.generate(req)
+                except Exception as exc:
+                    if budget_tracker and reservation_id and not reservation_finalized:
+                        reservation_finalized = True
+                        # Provider network / generate failed. Distinguish 'pre-network rejection' vs 'maybe-sent'.
+                        # Because generate() was invoked, the remote server may have processed the request.
+                        # Retain conservative exposure (prompt + max_output_tokens).
+                        budget_tracker.complete_call(
+                            reservation_id, actual_tokens=conservative_tokens, failed=True
+                        )
+                    if isinstance(exc, WorkflowExecutionError):
+                        raise
+                    reason = _classify_provider_error_reason(exc)
+                    raise WorkflowExecutionError(f"LLM generation failed: {reason}") from None
+
+                # Provider generated a response. Check if usage is reported.
+                known_actual_tokens = (
+                    resp.usage.total_tokens
+                    if (resp and resp.usage and resp.usage.total_tokens is not None)
+                    else None
+                )
+
                 resp_content = resp.text or ""
                 # Redact any inadvertent secret shapes from generated output
                 sanitized_output = redact_secrets_from_text(resp_content)
@@ -542,30 +567,44 @@ def execute_step_with_schema(
                 if len(sanitized_output) > MAX_AI_OUTPUT_CHARS:
                     sanitized_output = sanitized_output[:MAX_AI_OUTPUT_CHARS]
 
-                # Validate output size
-                validate_response_output(
-                    sanitized_output.encode("utf-8"),
-                    resp.usage.completion_tokens if resp.usage else 0,
-                    safety_limits,
-                )
-
-                if budget_tracker and reservation_id:
-                    actual_tokens = (
-                        resp.usage.total_tokens
-                        if (resp.usage and resp.usage.total_tokens is not None)
-                        else None
+                # Validate response output limits (may raise AISafetyError)
+                try:
+                    validate_response_output(
+                        sanitized_output.encode("utf-8"),
+                        resp.usage.completion_tokens if (resp and resp.usage) else 0,
+                        safety_limits,
                     )
-                    budget_tracker.complete_call(reservation_id, actual_tokens=actual_tokens)
+                except Exception:
+                    # Output validation failed after receiving provider response.
+                    # Finalize reservation exactly once, charging actual known usage if reported,
+                    # or conservative tokens if usage is missing.
+                    if budget_tracker and reservation_id and not reservation_finalized:
+                        reservation_finalized = True
+                        tokens_to_charge = (
+                            known_actual_tokens
+                            if known_actual_tokens is not None
+                            else conservative_tokens
+                        )
+                        budget_tracker.complete_call(
+                            reservation_id, actual_tokens=tokens_to_charge, failed=True
+                        )
+                    raise
 
-            except (AISafetyError, ProviderError, Exception) as exc:
-                if budget_tracker and reservation_id:
-                    # Distinguish 'not sent' (pre-network rejection) vs 'maybe-sent' provider error.
-                    # When a ProviderError/Exception occurred during or after generate(), the remote
-                    # provider may have processed both prompt and completion tokens before failing/timing out.
-                    # Retain full reserved exposure (prompt + max_output_tokens) so external spend is
-                    # not underreported when actual usage is unknown.
+                # Finalize reservation on successful processing
+                if budget_tracker and reservation_id and not reservation_finalized:
+                    reservation_finalized = True
+                    budget_tracker.complete_call(reservation_id, actual_tokens=known_actual_tokens)
+
+            except Exception as exc:
+                if budget_tracker and reservation_id and not reservation_finalized:
+                    reservation_finalized = True
+                    tokens_to_charge = (
+                        known_actual_tokens
+                        if ("known_actual_tokens" in locals() and known_actual_tokens is not None)
+                        else conservative_tokens
+                    )
                     budget_tracker.complete_call(
-                        reservation_id, actual_tokens=conservative_tokens, failed=True
+                        reservation_id, actual_tokens=tokens_to_charge, failed=True
                     )
                 if isinstance(exc, WorkflowExecutionError):
                     raise
