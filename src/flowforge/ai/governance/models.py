@@ -1,0 +1,234 @@
+"""Immutable data models and value objects for AI governance and budget management.
+
+Strict privacy: no raw prompts, secret API keys, provider tokens, or raw LLM responses
+are held in these records. All timestamps are UTC aware.
+"""
+
+from __future__ import annotations
+
+import datetime
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any
+
+from flowforge.ai.governance.exceptions import AIGovernanceError
+
+
+class BudgetScopeType(StrEnum):
+    """Scope boundaries for budget allocation and accounting."""
+
+    GLOBAL = "global"
+    TENANT = "tenant"
+    WORKFLOW = "workflow"
+    RUN = "run"
+    PROVIDER = "provider"
+
+
+@dataclass(frozen=True)
+class BudgetScope:
+    """Explicit, bounded hierarchical budget scope key."""
+
+    scope_type: BudgetScopeType
+    tenant_id: str | None = None
+    workflow_id: str | None = None
+    run_id: str | None = None
+    provider: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.scope_type, BudgetScopeType):
+            try:
+                object.__setattr__(self, "scope_type", BudgetScopeType(self.scope_type))
+            except ValueError as err:
+                raise AIGovernanceError(f"Invalid scope_type: {self.scope_type}") from err
+
+        # Validation rules:
+        if self.scope_type == BudgetScopeType.TENANT and not self.tenant_id:
+            raise AIGovernanceError("tenant_id is required for TENANT budget scope")
+        if self.scope_type == BudgetScopeType.WORKFLOW and (
+            not self.tenant_id or not self.workflow_id
+        ):
+            raise AIGovernanceError(
+                "tenant_id and workflow_id are required for WORKFLOW budget scope"
+            )
+        if self.scope_type == BudgetScopeType.RUN and (not self.tenant_id or not self.run_id):
+            raise AIGovernanceError("tenant_id and run_id are required for RUN budget scope")
+        if self.scope_type == BudgetScopeType.PROVIDER and not self.provider:
+            raise AIGovernanceError("provider is required for PROVIDER budget scope")
+
+    @property
+    def key(self) -> str:
+        """Deterministic canonical string representation for isolation and keying."""
+        parts = [f"type={self.scope_type.value}"]
+        if self.tenant_id is not None:
+            parts.append(f"tenant={self.tenant_id}")
+        if self.workflow_id is not None:
+            parts.append(f"workflow={self.workflow_id}")
+        if self.run_id is not None:
+            parts.append(f"run={self.run_id}")
+        if self.provider is not None:
+            parts.append(f"provider={self.provider}")
+        return ":".join(parts)
+
+
+@dataclass(frozen=True)
+class BudgetSettings:
+    """Versionable, bounded budget configuration limits."""
+
+    scope: BudgetScope
+    version: int = 1
+    max_calls: int | None = None
+    max_total_tokens: int | None = None
+    max_prompt_tokens: int | None = None
+    max_completion_tokens: int | None = None
+    max_estimated_cost_micros: int | None = None  # in micro-USD (1 USD = 1,000,000 micros)
+    max_duration_seconds: float | None = None
+    allowed_providers: tuple[str, ...] = ("mock", "ollama")  # Deny-by-default for hosted external
+    denied_providers: tuple[str, ...] = ()
+    allow_overrun: bool = (
+        False  # If True, records overrun rather than raising immediately on completion
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.version, int) or self.version <= 0:
+            raise AIGovernanceError("version must be a positive integer")
+
+        for name, val in [
+            ("max_calls", self.max_calls),
+            ("max_total_tokens", self.max_total_tokens),
+            ("max_prompt_tokens", self.max_prompt_tokens),
+            ("max_completion_tokens", self.max_completion_tokens),
+            ("max_estimated_cost_micros", self.max_estimated_cost_micros),
+        ]:
+            if val is not None and (isinstance(val, bool) or not isinstance(val, int) or val < 0):
+                raise AIGovernanceError(f"{name} must be a non-negative integer or None")
+
+        if self.max_duration_seconds is not None and (
+            isinstance(self.max_duration_seconds, bool)
+            or not isinstance(self.max_duration_seconds, (int, float))
+            or self.max_duration_seconds < 0
+        ):
+            raise AIGovernanceError("max_duration_seconds must be non-negative float or None")
+
+        # Normalize provider tuples
+        if not isinstance(self.allowed_providers, tuple):
+            object.__setattr__(self, "allowed_providers", tuple(self.allowed_providers))
+        if not isinstance(self.denied_providers, tuple):
+            object.__setattr__(self, "denied_providers", tuple(self.denied_providers))
+
+
+class ReservationStatus(StrEnum):
+    """Lifecycle state of an AI budget reservation."""
+
+    PENDING = "pending"
+    SETTLED = "settled"
+    RELEASED = "released"
+    EXPIRED = "expired"
+
+
+class SettlementType(StrEnum):
+    """The outcome of a completed or reconciled AI operation."""
+
+    EXACT = "exact"  # Provider returned verified actual tokens
+    ESTIMATED_EXPOSURE = (
+        "estimated_exposure"  # Dispatched / maybe-sent; provider response lost/failed
+    )
+    ZERO_COST_REJECTED = "zero_cost_rejected"  # Rejected locally before network dispatch (cost 0)
+    UNKNOWN_USAGE = (
+        "unknown_usage"  # Unknown actual usage; preserved estimated exposure conservatively
+    )
+
+
+class OverrunMarker(StrEnum):
+    """Truthful marker documenting whether and how an execution exceeded limits."""
+
+    NONE = "none"
+    CALLS_OVERRUN = "calls_overrun"
+    TOKENS_OVERRUN = "tokens_overrun"
+    COST_OVERRUN = "cost_overrun"
+    TIME_OVERRUN = "time_overrun"
+
+
+@dataclass(frozen=True)
+class ReservationRecord:
+    """Immutable record of an authorized and reserved AI call allowance."""
+
+    reservation_id: str
+    idempotency_key: str
+    scope: BudgetScope
+    provider: str
+    model: str
+    estimated_prompt_tokens: int
+    estimated_completion_tokens: int
+    estimated_total_tokens: int
+    estimated_cost_micros: int
+    attempt_number: int
+    status: ReservationStatus
+    created_at: datetime.datetime
+    expires_at: datetime.datetime | None = None
+    audit_metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.reservation_id:
+            raise AIGovernanceError("reservation_id cannot be empty")
+        if not self.idempotency_key:
+            raise AIGovernanceError("idempotency_key cannot be empty")
+        if self.attempt_number < 1:
+            raise AIGovernanceError("attempt_number must be >= 1")
+        if self.created_at.tzinfo is None:
+            raise AIGovernanceError("created_at must be timezone-aware (UTC)")
+
+
+@dataclass(frozen=True)
+class SettlementRecord:
+    """Immutable record of a finalized reservation settlement."""
+
+    settlement_id: str
+    reservation_id: str
+    idempotency_key: str
+    scope: BudgetScope
+    provider: str
+    model: str
+    settlement_type: SettlementType
+    actual_prompt_tokens: int
+    actual_completion_tokens: int
+    actual_total_tokens: int
+    actual_cost_micros: int
+    attempt_number: int
+    settled_at: datetime.datetime
+    overrun_marker: OverrunMarker = OverrunMarker.NONE
+    overrun_tokens: int = 0
+    overrun_cost_micros: int = 0
+    duration_seconds: float = 0.0
+    audit_metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.settlement_id:
+            raise AIGovernanceError("settlement_id cannot be empty")
+        if not self.reservation_id:
+            raise AIGovernanceError("reservation_id cannot be empty")
+        if self.settled_at.tzinfo is None:
+            raise AIGovernanceError("settled_at must be timezone-aware (UTC)")
+
+
+@dataclass(frozen=True)
+class UsageLedgerEntry:
+    """Single immutable audit log entry in the AI usage ledger."""
+
+    entry_id: str
+    event_type: str  # "reservation", "settlement", "release", "denial"
+    idempotency_key: str
+    scope: BudgetScope
+    provider: str
+    model: str
+    timestamp: datetime.datetime
+    tokens_delta: int
+    cost_micros_delta: int
+    calls_delta: int
+    overrun_marker: OverrunMarker = OverrunMarker.NONE
+    notes: str = ""
+    audit_metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.timestamp.tzinfo is None:
+            raise AIGovernanceError("timestamp must be timezone-aware (UTC)")
