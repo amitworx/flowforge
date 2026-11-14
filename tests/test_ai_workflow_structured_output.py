@@ -17,6 +17,7 @@ TDD RED suite covering:
 - Export/import and clone boundaries with structured output steps.
 """
 
+import copy
 import json
 
 import pytest
@@ -31,6 +32,7 @@ from flowforge.workflows.engine import (
     WorkflowExecutionError,
     execute_step,
     execute_workflow_pipeline,
+    execute_workflow_pipeline_with_schema,
     validate_step_definitions,
 )
 from flowforge.workflows.export import (
@@ -41,10 +43,20 @@ from flowforge.workflows.export import (
 
 
 class MockLLMProvider(LLMProvider):
-    def __init__(self, responses: list[str] | None = None, usage: TokenUsage | None = None):
+    def __init__(
+        self,
+        responses: list[str] | None = None,
+        usage: TokenUsage | None = None,
+        omit_usage: bool = False,
+    ):
         self.responses = responses or ["{}"]
         self.call_count = 0
-        self.usage = usage or TokenUsage(prompt_tokens=10, completion_tokens=15, total_tokens=25)
+        if omit_usage:
+            self.usage = None
+        else:
+            self.usage = usage or TokenUsage(
+                prompt_tokens=10, completion_tokens=15, total_tokens=25
+            )
         self.recorded_requests = []
 
     def generate(self, request) -> LLMResponse:
@@ -266,7 +278,8 @@ def test_execute_step_rejects_markdown_code_fences():
     provider = MockLLMProvider(responses=[fenced_payload])
     data = [{"text": "check"}]
     with pytest.raises(
-        WorkflowExecutionError, match="Structured output validation failed: JSON parse failed"
+        WorkflowExecutionError,
+        match="Structured output validation failed: STRUCTURED_OUTPUT_PARSE_ERROR",
     ):
         execute_step(data, step, schema=["text"], llm_provider=provider)
 
@@ -283,7 +296,8 @@ def test_execute_step_rejects_malformed_json_without_repair():
     provider = MockLLMProvider(responses=["{incomplete_json: "])
     data = [{"text": "check"}]
     with pytest.raises(
-        WorkflowExecutionError, match="Structured output validation failed: JSON parse failed"
+        WorkflowExecutionError,
+        match="Structured output validation failed: STRUCTURED_OUTPUT_PARSE_ERROR",
     ):
         execute_step(data, step, schema=["text"], llm_provider=provider)
 
@@ -663,3 +677,177 @@ def test_clone_and_export_import_workflow_with_structured_schema():
     assert serializer.is_valid(), serializer.errors
     imported_steps = serializer.validated_data["steps"]
     assert imported_steps[0]["output_schema"] == schema
+
+    # 3. Clone workflow definition and verify output_schema is preserved and owner-isolated
+    from flowforge.workflows.serializers import WorkflowCloneRequestSerializer
+
+    clone_serializer = WorkflowCloneRequestSerializer(data={"name": "Cloned Workflow"})
+    assert clone_serializer.is_valid(), clone_serializer.errors
+    cloned_wf = WorkflowDefinition.objects.create(
+        owner=user,
+        name=clone_serializer.validated_data.get("name"),
+        steps=copy.deepcopy(wf.steps),
+    )
+    assert cloned_wf.steps[0]["output_schema"] == schema
+    assert cloned_wf.steps[0]["output_schema"] is not wf.steps[0]["output_schema"]
+
+    # 4. Preview workflow with combined deterministic steps without provider calls
+    preview_steps = [
+        {"op": "select_columns", "columns": ["text", "val"]},
+        {"op": "filter_equals", "column": "val", "value": 10},
+        {"op": "rename_columns", "mapping": {"text": "prompt_input"}},
+    ]
+    preview_data = [
+        {"text": "keep", "val": 10, "ignore": 1},
+        {"text": "drop", "val": 20, "ignore": 2},
+    ]
+    preview_wf = WorkflowDefinition.objects.create(
+        owner=user,
+        name="Deterministic Workflow",
+        steps=preview_steps,
+    )
+    preview_out, preview_audits, preview_schema = execute_workflow_pipeline_with_schema(
+        preview_data, preview_wf.steps
+    )
+    assert len(preview_out) == 1
+    assert preview_out[0] == {"prompt_input": "keep", "val": 10}
+    assert preview_schema == ["prompt_input", "val"]
+    assert len(preview_audits) == 3
+
+
+def test_structured_validation_fixed_allowlisted_reason_codes():
+    """Verify that structured output errors use fixed allowlisted reason codes and never leak content."""
+    step = {
+        "op": "llm_generate",
+        "provider": "ollama",
+        "model": "llama3",
+        "prompt_template": "Classify {{ text }}",
+        "output_column": "classification",
+        "output_schema": {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "enum": ["A", "B"]},
+                "score": {"type": "integer", "minimum": 0, "maximum": 100},
+            },
+            "required": ["category", "score"],
+            "additionalProperties": False,
+        },
+    }
+
+    # TYPE_MISMATCH
+    p_type = MockLLMProvider(responses=[json.dumps({"category": "A", "score": "not_an_int"})])
+    with pytest.raises(WorkflowExecutionError) as exc_info:
+        execute_step([{"text": "x"}], step, schema=["text"], llm_provider=p_type)
+    assert (
+        exc_info.value.message
+        == "Structured output validation failed: STRUCTURED_OUTPUT_INVALID (TYPE_MISMATCH)"
+    )
+
+    # MISSING_REQUIRED
+    p_miss = MockLLMProvider(responses=[json.dumps({"category": "A"})])
+    with pytest.raises(WorkflowExecutionError) as exc_info:
+        execute_step([{"text": "x"}], step, schema=["text"], llm_provider=p_miss)
+    assert (
+        exc_info.value.message
+        == "Structured output validation failed: STRUCTURED_OUTPUT_INVALID (MISSING_REQUIRED)"
+    )
+
+    # ADDITIONAL_PROPERTIES
+    p_extra = MockLLMProvider(
+        responses=[json.dumps({"category": "A", "score": 50, "extra_leaked_key": "val"})]
+    )
+    with pytest.raises(WorkflowExecutionError) as exc_info:
+        execute_step([{"text": "x"}], step, schema=["text"], llm_provider=p_extra)
+    assert (
+        exc_info.value.message
+        == "Structured output validation failed: STRUCTURED_OUTPUT_INVALID (ADDITIONAL_PROPERTIES)"
+    )
+    assert "extra_leaked_key" not in exc_info.value.message
+
+    # ENUM_MISMATCH
+    p_enum = MockLLMProvider(responses=[json.dumps({"category": "C", "score": 50})])
+    with pytest.raises(WorkflowExecutionError) as exc_info:
+        execute_step([{"text": "x"}], step, schema=["text"], llm_provider=p_enum)
+    assert (
+        exc_info.value.message
+        == "Structured output validation failed: STRUCTURED_OUTPUT_INVALID (ENUM_MISMATCH)"
+    )
+
+
+def test_definition_and_import_time_avoids_arbitrary_schema_interpolation():
+    """Verify that invalid schema at definition/import time produces a safe generic error without echoing secrets."""
+    secret_marker = "SUPER_SECRET_INTERNAL_SCHEMA_KEY_9999"
+    step = {
+        "op": "llm_generate",
+        "provider": "ollama",
+        "model": "llama3",
+        "prompt_template": "Classify {{ text }}",
+        "output_column": "classification",
+        "output_schema": {
+            "type": "object",
+            secret_marker: {"type": "string"},
+        },
+    }
+    with pytest.raises(WorkflowExecutionError) as exc_info:
+        validate_step_definitions([step])
+    assert secret_marker not in str(exc_info.value)
+    assert exc_info.value.message == "Step 0 (llm_generate): Invalid output_schema definition."
+
+
+def test_budget_overrun_preserved_when_structured_validation_fails():
+    """Verify that when structured validation fails, any budget overrun is truthfully preserved and not masked."""
+    tracker = ExecutionBudgetTracker(max_total_tokens=100, max_ai_calls=5)
+    provider = MockLLMProvider(
+        responses=['{"invalid": true}'],
+        usage=TokenUsage(prompt_tokens=20, completion_tokens=100, total_tokens=120),
+    )
+    step = {
+        "op": "llm_generate",
+        "provider": "ollama",
+        "model": "llama3",
+        "prompt_template": "Analyze {{ text }}",
+        "output_column": "out",
+        "max_output_tokens": 50,
+        "output_schema": {"type": "object", "required": ["expected"]},
+    }
+    data = [{"text": "hello"}]
+
+    with pytest.raises(WorkflowExecutionError) as exc_info:
+        execute_step(data, step, schema=["text"], llm_provider=provider, budget_tracker=tracker)
+
+    # Must preserve the budget policy violation / overrun error without masking
+    assert (
+        "Safety policy violation (AIPolicyLimitError)" in exc_info.value.message
+        or "budget exceeded" in exc_info.value.message.lower()
+    )
+    assert tracker.tokens_count == 120
+    assert tracker.has_overrun is True
+    assert tracker.tokens_overrun == 20
+    assert tracker.reserved_tokens == 0
+    assert tracker.calls_count == 1
+
+
+def test_budget_charged_estimated_tokens_when_usage_missing_on_validation_failure():
+    """Verify that when structured validation fails and provider returns no usage, conservative tokens are charged exactly once."""
+    tracker = ExecutionBudgetTracker(max_total_tokens=1000, max_ai_calls=5)
+    provider = MockLLMProvider(responses=['{"invalid": true}'], omit_usage=True)
+    step = {
+        "op": "llm_generate",
+        "provider": "ollama",
+        "model": "llama3",
+        "prompt_template": "Analyze {{ text }}",
+        "output_column": "out",
+        "max_output_tokens": 50,
+        "output_schema": {"type": "object", "required": ["expected"]},
+    }
+    data = [{"text": "hello"}]
+
+    with pytest.raises(WorkflowExecutionError) as exc_info:
+        execute_step(data, step, schema=["text"], llm_provider=provider, budget_tracker=tracker)
+
+    assert "Structured output validation failed" in exc_info.value.message
+    # Conservative tokens: estimated prompt tokens (~11) + max_output_tokens (50) = ~61
+    assert tracker.tokens_count >= 50
+    assert tracker.reserved_tokens == 0
+    assert tracker.calls_count == 1
+    assert tracker.has_overrun is False

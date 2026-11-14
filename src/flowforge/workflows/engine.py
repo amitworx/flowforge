@@ -36,6 +36,50 @@ class WorkflowExecutionError(Exception):
         self.failed_step_audit = failed_step_audit
 
 
+# Reason codes for structured LLM output failures
+STRUCTURED_OUTPUT_INVALID_REASON = "STRUCTURED_OUTPUT_INVALID"
+STRUCTURED_OUTPUT_PARSE_REASON = "STRUCTURED_OUTPUT_PARSE_ERROR"
+STRUCTURED_OUTPUT_LIMIT_REASON = "STRUCTURED_OUTPUT_LIMIT_EXCEEDED"
+
+# Allowlisted reason codes for deterministic, safe auditing and logs
+ALLOWLISTED_STRUCTURED_REASON_CODES = {
+    "NON_FINITE_NUMBER",
+    "NUMBER_TOO_SMALL",
+    "NUMBER_TOO_LARGE",
+    "STRING_TOO_SHORT",
+    "STRING_TOO_LONG",
+    "ARRAY_TOO_SHORT",
+    "ARRAY_TOO_LONG",
+    "MISSING_REQUIRED",
+    "ADDITIONAL_PROPERTIES",
+    "TYPE_MISMATCH",
+    "ENUM_MISMATCH",
+}
+
+
+def _classify_structured_output_error(exc: Exception) -> str:
+    """Map structured output exceptions to fixed allowlisted reason codes.
+
+    Never interpolates raw exception strings, model text, schema keys, or paths.
+    """
+    from flowforge.ai.structured.exceptions import (
+        ParseError,
+        PayloadLimitError,
+        ValidationError,
+    )
+
+    if isinstance(exc, ParseError):
+        return STRUCTURED_OUTPUT_PARSE_REASON
+    if isinstance(exc, PayloadLimitError):
+        return STRUCTURED_OUTPUT_LIMIT_REASON
+    if isinstance(exc, ValidationError):
+        code = getattr(exc, "code", None)
+        if code and code in ALLOWLISTED_STRUCTURED_REASON_CODES:
+            return f"{STRUCTURED_OUTPUT_INVALID_REASON} ({code})"
+        return STRUCTURED_OUTPUT_INVALID_REASON
+    return STRUCTURED_OUTPUT_INVALID_REASON
+
+
 MAX_STEPS = 10
 MAX_ROWS = 1000
 MAX_NAME_LENGTH = 128
@@ -333,10 +377,9 @@ def validate_step_definitions(steps: Any) -> list[dict[str, Any]]:
                     from flowforge.ai.structured.exceptions import StructuredOutputError
 
                     SchemaContract.from_dict(raw_schema)
-                except StructuredOutputError as exc:
-                    safe_msg = redact_secrets_from_text(str(exc))
+                except StructuredOutputError:
                     raise WorkflowExecutionError(
-                        f"Step {idx} (llm_generate): Invalid output_schema: {safe_msg}"
+                        f"Step {idx} (llm_generate): Invalid output_schema definition."
                     ) from None
                 except Exception:
                     raise WorkflowExecutionError(
@@ -639,9 +682,9 @@ def execute_step_with_schema(
                             budget_tracker.complete_call(
                                 reservation_id, actual_tokens=tokens_to_charge, failed=True
                             )
-                        safe_reason = redact_secrets_from_text(str(exc))
+                        reason_code = _classify_structured_output_error(exc)
                         raise WorkflowExecutionError(
-                            f"Structured output validation failed: {safe_reason}"
+                            f"Structured output validation failed: {reason_code}"
                         ) from None
 
                 # Finalize reservation on successful processing
