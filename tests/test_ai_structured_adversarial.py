@@ -258,7 +258,8 @@ class TestAbsentRequiredFields:
             _validate('{"id": 1}', schema)
         err = exc_info.value
         assert err.code == "MISSING_REQUIRED"
-        assert "name" in str(err)
+        assert "name" not in str(err)
+        assert "required" in str(err).lower()
 
     def test_required_field_null_value_satisfies_presence(self):
         """If 'name' is required and present with null value, it's present (not absent)."""

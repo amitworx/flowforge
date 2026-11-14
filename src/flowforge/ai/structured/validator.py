@@ -50,11 +50,9 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from typing import Any
 
 from flowforge.ai.structured.exceptions import (
-    MAX_PATH_SEGMENT_LEN,
     ParseError,
     PayloadLimitError,
     SchemaError,
@@ -591,18 +589,19 @@ def _validate_number(value: int | float, schema: dict[str, Any], path: Validatio
 def _validate_object(value: dict[str, Any], schema: dict[str, Any], path: ValidationPath) -> None:
     # Required fields
     required = schema.get("required", [])
+    missing_count = 0
     for field_name in required:
         if field_name not in value:
-            # Sanitize field name: strip control codes and bound length
-            safe_field = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", str(field_name))[:MAX_PATH_SEGMENT_LEN]
-            if not safe_field:
-                safe_field = "property"
-            raise ValidationError(
-                f"required field {safe_field!r} is missing",
-                path=path,
-                schema_type="object",
-                code="MISSING_REQUIRED",
-            )
+            missing_count += 1
+
+    if missing_count > 0:
+        prop_str = "property" if missing_count == 1 else "properties"
+        raise ValidationError(
+            f"required {prop_str} missing (found {missing_count} missing required {prop_str})",
+            path=path,
+            schema_type="object",
+            code="MISSING_REQUIRED",
+        )
 
     # Properties
     properties = schema.get("properties", {})

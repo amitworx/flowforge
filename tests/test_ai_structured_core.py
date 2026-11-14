@@ -401,7 +401,9 @@ class TestObjectValidation:
             _validate('{"age": 30}', {"type": "object", "required": ["name"]})
         err = exc_info.value
         assert err.code == "MISSING_REQUIRED"
-        assert "name" in str(err)
+        # Does NOT leak raw required field name 'name'; uses generic metadata
+        assert "name" not in str(err)
+        assert "required" in str(err).lower()
         # Path should reference root
         assert "$" in str(err.path)
 
