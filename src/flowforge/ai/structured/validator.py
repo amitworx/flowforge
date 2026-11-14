@@ -50,9 +50,11 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any
 
 from flowforge.ai.structured.exceptions import (
+    MAX_PATH_SEGMENT_LEN,
     ParseError,
     PayloadLimitError,
     SchemaError,
@@ -176,7 +178,7 @@ def _validate_schema_shape(schema: Any, *, depth: int, node_count: list[int]) ->
     unsupported = set(schema.keys()) - SUPPORTED_SCHEMA_KEYWORDS
     if unsupported:
         raise SchemaError(
-            f"unsupported schema keyword(s): {', '.join(sorted(unsupported))}; "
+            f"unsupported schema keyword detected ({len(unsupported)} unexpected keyword(s)); "
             f"supported: {', '.join(sorted(SUPPORTED_SCHEMA_KEYWORDS))}"
         )
 
@@ -185,14 +187,14 @@ def _validate_schema_shape(schema: Any, *, depth: int, node_count: list[int]) ->
         if isinstance(type_val, str):
             if type_val not in SUPPORTED_TYPE_NAMES:
                 raise SchemaError(
-                    f"unsupported schema type {type_val!r}; "
+                    f"unsupported schema type detected; "
                     f"supported: {', '.join(sorted(SUPPORTED_TYPE_NAMES))}"
                 )
         elif isinstance(type_val, list):
             for t in type_val:
                 if not isinstance(t, str) or t not in SUPPORTED_TYPE_NAMES:
                     raise SchemaError(
-                        f"unsupported type name {t!r} in union; "
+                        f"unsupported schema type detected in union; "
                         f"supported: {', '.join(sorted(SUPPORTED_TYPE_NAMES))}"
                     )
         else:
@@ -591,8 +593,12 @@ def _validate_object(value: dict[str, Any], schema: dict[str, Any], path: Valida
     required = schema.get("required", [])
     for field_name in required:
         if field_name not in value:
+            # Sanitize field name: strip control codes and bound length
+            safe_field = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", str(field_name))[:MAX_PATH_SEGMENT_LEN]
+            if not safe_field:
+                safe_field = "property"
             raise ValidationError(
-                f"required field {field_name!r} is missing",
+                f"required field {safe_field!r} is missing",
                 path=path,
                 schema_type="object",
                 code="MISSING_REQUIRED",

@@ -117,7 +117,8 @@ class TestSchemaContractConstruction:
         with pytest.raises(SchemaError) as exc_info:
             _contract({"type": "object", "$ref": "#/definitions/Foo"})
         assert "unsupported schema keyword" in str(exc_info.value).lower()
-        assert "$ref" in str(exc_info.value)
+        # Does not leak raw keyword name
+        assert "$ref" not in str(exc_info.value)
 
     def test_unsupported_type_raises_schema_error(self):
         with pytest.raises(SchemaError) as exc_info:
