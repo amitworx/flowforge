@@ -19,7 +19,10 @@ class WorkflowServiceError(Exception):
 
 
 def execute_workflow_run(
-    workflow_def: WorkflowDefinition, source_job: ProcessingJob, user
+    workflow_def: WorkflowDefinition,
+    source_job: ProcessingJob,
+    user,
+    llm_provider=None,
 ) -> WorkflowRun:
     """
     Synchronously execute a WorkflowDefinition on a source ProcessingJob.
@@ -43,7 +46,7 @@ def execute_workflow_run(
 
     try:
         output_data, step_audits, final_schema = execute_workflow_pipeline_with_schema(
-            input_data, step_snapshot, schema=initial_schema
+            input_data, step_snapshot, schema=initial_schema, llm_provider=llm_provider
         )
 
         with transaction.atomic():

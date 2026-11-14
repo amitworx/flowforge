@@ -1,12 +1,21 @@
 import logging
+import os
 import uuid
 
 from celery import shared_task
 from django.db import models, transaction
 from django.utils import timezone
 
+from flowforge.ai.providers import (
+    LLMProvider,
+    OllamaProvider,
+    OpenAICompatibleProvider,
+    sanitize_error_message,
+)
+from flowforge.ai.safety import ExecutionBudgetTracker, redact_secrets_from_text
 from flowforge.processing.models import ProcessingJob
 from flowforge.workflows.engine import (
+    MAX_AI_ROWS_PER_WORKFLOW,
     WorkflowExecutionError,
     execute_workflow_pipeline,
     validate_step_definitions,
@@ -16,6 +25,61 @@ from flowforge.workflows.models import WorkflowRun, WorkflowStepRun
 logger = logging.getLogger(__name__)
 
 GENERIC_INTERNAL_ERROR_MESSAGE = "Internal workflow execution error occurred."
+
+
+def resolve_workflow_llm_providers(step_snapshot: list[dict]) -> dict[str, LLMProvider]:
+    """
+    Safely resolves configured LLMProvider instances from environment/admin configuration.
+    Returns a mapping of provider name -> LLMProvider instance.
+    Enforces strict opt-in and hosted billing safeguards (FLOWFORGE_ALLOW_HOSTED_AI_BILLING).
+    Never exposes secrets into logs or database records.
+    """
+    ai_enabled = os.environ.get("FLOWFORGE_ENABLE_AI_WORKFLOW_STEPS", "false").lower() in (
+        "true",
+        "1",
+    )
+    if not ai_enabled:
+        return {}
+
+    needed_providers = {
+        step.get("provider")
+        for step in step_snapshot
+        if isinstance(step, dict) and step.get("op") == "llm_generate"
+    }
+
+    providers: dict[str, LLMProvider] = {}
+
+    if "ollama" in needed_providers:
+        ollama_url = os.environ.get("FLOWFORGE_OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+        providers["ollama"] = OllamaProvider(base_url=ollama_url)
+
+    if "openai" in needed_providers:
+        # Hosted billing guard: require explicit opt-in
+        allow_hosted = os.environ.get("FLOWFORGE_ALLOW_HOSTED_AI_BILLING", "false").lower() in (
+            "true",
+            "1",
+        )
+        api_key = os.environ.get("FLOWFORGE_OPENAI_API_KEY")
+        base_url = os.environ.get("FLOWFORGE_OPENAI_BASE_URL", "https://api.openai.com/v1")
+        if allow_hosted and api_key:
+            providers["openai"] = OpenAICompatibleProvider(base_url=base_url, api_key=api_key)
+
+    return providers
+
+
+def resolve_workflow_llm_provider(step_snapshot: list[dict]) -> LLMProvider | None:
+    """
+    Safely resolves configured primary LLMProvider instance for backward compatibility.
+    """
+    providers = resolve_workflow_llm_providers(step_snapshot)
+    if not providers:
+        return None
+    for step in step_snapshot:
+        if isinstance(step, dict) and step.get("op") == "llm_generate":
+            p = providers.get(step.get("provider"))
+            if p:
+                return p
+    return next(iter(providers.values()), None)
 
 
 @shared_task(max_retries=0)
@@ -153,9 +217,19 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
     initial_input_row_count = len(input_data)
     initial_schema = source_job.column_names or (list(input_data[0].keys()) if input_data else [])
 
+    llm_providers = resolve_workflow_llm_providers(step_snapshot)
+    budget_tracker = ExecutionBudgetTracker(
+        max_ai_calls=MAX_AI_ROWS_PER_WORKFLOW,
+        max_total_tokens=100_000,
+    )
+
     try:
         output_data, step_audits = execute_workflow_pipeline(
-            input_data, step_snapshot, schema=initial_schema
+            input_data,
+            step_snapshot,
+            schema=initial_schema,
+            llm_providers=llm_providers,
+            budget_tracker=budget_tracker,
         )
         from flowforge.workflows.export import derive_workflow_schema
 
@@ -197,6 +271,7 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
             WorkflowStepRun.objects.bulk_create(step_runs)
 
     except WorkflowExecutionError as exc:
+        sanitized_summary = redact_secrets_from_text(sanitize_error_message(exc.message))
         with transaction.atomic():
             rows_updated = WorkflowRun.objects.filter(
                 id=run_id,
@@ -207,7 +282,7 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
                 output_data=[],
                 input_row_count=initial_input_row_count,
                 output_row_count=0,
-                error_summary=exc.message,
+                error_summary=sanitized_summary,
                 finished_at=timezone.now(),
             )
             if rows_updated == 0:
@@ -231,6 +306,9 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
                     )
                 )
             if exc.failed_step_audit:
+                f_summary = exc.failed_step_audit.get("error_summary")
+                if f_summary:
+                    f_summary = redact_secrets_from_text(sanitize_error_message(str(f_summary)))
                 step_objs.append(
                     WorkflowStepRun(
                         workflow_run=run,
@@ -239,13 +317,17 @@ def execute_workflow_run_task(run_id: str, claim_token: str | None = None):
                         status=exc.failed_step_audit["status"],
                         input_row_count=exc.failed_step_audit["input_row_count"],
                         output_row_count=exc.failed_step_audit["output_row_count"],
-                        error_summary=exc.failed_step_audit["error_summary"],
+                        error_summary=f_summary,
                     )
                 )
             WorkflowStepRun.objects.bulk_create(step_objs)
 
-    except Exception:
-        logger.exception("Unexpected exception executing WorkflowRun %s", run_id)
+    except Exception as exc:
+        logger.error(
+            "Unexpected exception executing WorkflowRun %s: %s (internal error code: ERR_WORKFLOW_INTERNAL_EXECUTION_FAILURE)",
+            run_id,
+            type(exc).__name__,
+        )
         with transaction.atomic():
             WorkflowRun.objects.filter(
                 id=run_id,
