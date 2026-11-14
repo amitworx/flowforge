@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -12,8 +13,10 @@ from flowforge.ai.retrieval.chunking import ChunkingConfig, TextChunk, chunk_tex
 from flowforge.ai.retrieval.exceptions import RetrievalContractError, RetrievalError
 from flowforge.ai.retrieval.pgvector.config import (
     MAX_BATCH_SIZE,
+    MAX_FILTER_IN_ITEMS,
     MAX_METADATA_DEPTH,
     MAX_METADATA_SIZE_BYTES,
+    MAX_PGVECTOR_DIMENSION,
     MAX_TEXT_CONTENT_LENGTH,
     MAX_TOP_K,
 )
@@ -38,6 +41,23 @@ MAX_CHUNKS_PER_INGEST: int = 10_000
 DEFAULT_BATCH_SIZE: int = 64
 DEFAULT_MAX_TOP_K: int = 100
 _DOC_ID_ALLOWED_RE = re.compile(r"^[a-zA-Z0-9_\-\.:#]+$")
+_FILTER_KEY_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_\.]{0,63}$")
+_SUPPORTED_FILTER_OPERATORS = {"$eq", "$in", "$ne"}
+
+
+def _validate_strict_int(
+    val: Any, field_name: str, min_val: int = 1, max_val: int | None = None
+) -> int:
+    """Validate that val is a strict int (not bool, float, or str) within [min_val, max_val]."""
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise RetrievalContractError(
+            f"{field_name} must be a strict integer, got {type(val).__name__}"
+        )
+    if val < min_val:
+        raise RetrievalContractError(f"{field_name} must be >= {min_val}, got {val}")
+    if max_val is not None and val > max_val:
+        raise RetrievalContractError(f"{field_name} must be <= {max_val}, got {val}")
+    return val
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,22 +72,31 @@ class IngestionConfig:
     max_chunks_per_ingest: int = MAX_CHUNKS_PER_INGEST
 
     def __post_init__(self) -> None:
-        if self.batch_size < 1 or self.batch_size > MAX_BATCH_SIZE:
-            raise RetrievalContractError(
-                f"batch_size must be between 1 and {MAX_BATCH_SIZE}, got {self.batch_size}"
+        _validate_strict_int(self.batch_size, "batch_size", min_val=1, max_val=MAX_BATCH_SIZE)
+        _validate_strict_int(self.max_top_k, "max_top_k", min_val=1, max_val=MAX_TOP_K)
+        _validate_strict_int(
+            self.max_documents_per_batch,
+            "max_documents_per_batch",
+            min_val=1,
+            max_val=MAX_DOCUMENTS_PER_BATCH,
+        )
+        _validate_strict_int(
+            self.max_chunks_per_ingest,
+            "max_chunks_per_ingest",
+            min_val=1,
+            max_val=MAX_CHUNKS_PER_INGEST,
+        )
+
+        if self.expected_dimension is not None:
+            _validate_strict_int(
+                self.expected_dimension,
+                "expected_dimension",
+                min_val=1,
+                max_val=MAX_PGVECTOR_DIMENSION,
             )
-        if self.max_top_k < 1 or self.max_top_k > MAX_TOP_K:
-            raise RetrievalContractError(
-                f"max_top_k must be between 1 and {MAX_TOP_K}, got {self.max_top_k}"
-            )
-        if self.expected_dimension is not None and self.expected_dimension < 1:
-            raise RetrievalContractError(
-                f"expected_dimension must be positive integer, got {self.expected_dimension}"
-            )
-        if self.max_documents_per_batch < 1:
-            raise RetrievalContractError("max_documents_per_batch must be >= 1")
-        if self.max_chunks_per_ingest < 1:
-            raise RetrievalContractError("max_chunks_per_ingest must be >= 1")
+
+        if not isinstance(self.chunking_config, ChunkingConfig):
+            raise RetrievalContractError("chunking_config must be an instance of ChunkingConfig")
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,24 +140,20 @@ def build_tenant_document_id(
 
     Format:
         If chunk_index is None:
-            t:{tenant_hash}:{raw_document_id}
+            t_{tenant_hash}_{raw_document_id}
         If chunk_index is provided:
-            t:{tenant_hash}:{raw_document_id}:c{chunk_index}[:{chunk_hash[:8]}]
+            t_{tenant_hash}_{raw_document_id}_c{chunk_index}[_{chunk_hash[:8]}]
     """
     valid_tenant = validate_tenant_scope(tenant_id)
     if not isinstance(raw_document_id, str):
-        raise RetrievalContractError(
-            f"document_id must be a string, got {type(raw_document_id).__name__}"
-        )
+        raise RetrievalContractError("document_id must be a string")
     raw_doc_id = raw_document_id.strip()
     if not raw_doc_id:
         raise RetrievalContractError("document_id cannot be empty or whitespace-only")
     if len(raw_doc_id) > MAX_DOCUMENT_ID_LENGTH:
-        raise RetrievalContractError(
-            f"document_id exceeds maximum length of {MAX_DOCUMENT_ID_LENGTH} characters"
-        )
+        raise RetrievalContractError("document_id exceeds maximum length limit")
     if not _DOC_ID_ALLOWED_RE.match(raw_doc_id):
-        raise RetrievalContractError(f"document_id contains disallowed characters: '{raw_doc_id}'")
+        raise RetrievalContractError("document_id contains disallowed characters")
 
     # Deterministic short tenant hash (12 chars hex)
     t_hash = hashlib.sha256(valid_tenant.encode("utf-8")).hexdigest()[:12]
@@ -136,8 +161,8 @@ def build_tenant_document_id(
     if chunk_index is None:
         return f"t_{t_hash}_{raw_doc_id}"
 
-    if chunk_index < 0:
-        raise RetrievalContractError(f"chunk_index cannot be negative, got {chunk_index}")
+    if isinstance(chunk_index, bool) or not isinstance(chunk_index, int) or chunk_index < 0:
+        raise RetrievalContractError("chunk_index must be a non-negative integer")
 
     base = f"t_{t_hash}_{raw_doc_id}_c{chunk_index}"
     if chunk_hash:
@@ -153,21 +178,15 @@ def sanitize_and_validate_metadata(
 ) -> dict[str, Any]:
     """Validate and copy metadata ensuring bounding and no forbidden nesting/size."""
     if not isinstance(metadata, dict):
-        raise RetrievalContractError(
-            f"metadata must be a dictionary, got {type(metadata).__name__}"
-        )
+        raise RetrievalContractError("metadata must be a dictionary")
 
     def _check_depth(obj: Any, depth: int) -> None:
         if depth > max_depth:
-            raise RetrievalContractError(
-                f"Metadata nesting depth exceeds maximum allowed limit ({max_depth})"
-            )
+            raise RetrievalContractError("Metadata nesting depth exceeds maximum allowed limit")
         if isinstance(obj, dict):
             for k, v in obj.items():
                 if not isinstance(k, str):
-                    raise RetrievalContractError(
-                        f"Metadata key must be a string, got {type(k).__name__}"
-                    )
+                    raise RetrievalContractError("Metadata key must be a string")
                 if isinstance(v, (dict, list)):
                     _check_depth(v, depth + 1)
         elif isinstance(obj, list):
@@ -179,55 +198,56 @@ def sanitize_and_validate_metadata(
 
     try:
         encoded = json.dumps(metadata, separators=(",", ":"), ensure_ascii=True)
-    except (TypeError, ValueError) as err:
-        raise RetrievalContractError(f"Metadata is not JSON-serializable: {err}") from err
+    except (TypeError, ValueError):
+        raise RetrievalContractError("Metadata is not JSON-serializable") from None
 
     if len(encoded.encode("utf-8")) > max_size:
-        raise RetrievalContractError(
-            f"Metadata size ({len(encoded.encode('utf-8'))} bytes) exceeds maximum limit ({max_size} bytes)"
-        )
+        raise RetrievalContractError("Metadata size exceeds maximum limit")
 
     return json.loads(encoded)
 
 
 def validate_query_filter_bounds(filter_metadata: dict[str, Any]) -> None:
-    """Validate that query filter metadata does not contain malicious or oversized keys/structures."""
+    """Validate that query filter metadata matches safe pgvector adapter semantics and bounds."""
     if not isinstance(filter_metadata, dict):
-        raise RetrievalContractError(
-            f"filter_metadata must be a dict, got {type(filter_metadata).__name__}"
-        )
+        raise RetrievalContractError("filter_metadata must be a dictionary")
     if len(filter_metadata) > 20:
-        raise RetrievalContractError("filter_metadata exceeds maximum allowed filter keys (20)")
+        raise RetrievalContractError("filter_metadata exceeds maximum allowed filter keys")
     for key, val in filter_metadata.items():
-        if not isinstance(key, str) or not key.strip():
-            raise RetrievalContractError("filter_metadata keys must be non-empty strings")
-        if len(key) > 64:
-            raise RetrievalContractError(f"filter_metadata key '{key}' exceeds maximum length 64")
-        if isinstance(val, (dict, list)):
-            if isinstance(val, list) and len(val) > 100:
-                raise RetrievalContractError("filter_metadata list value exceeds max items (100)")
-            if isinstance(val, dict):
-                # Only simple operator dicts allowed, depth 1
-                for sub_k in val:
-                    if not isinstance(sub_k, str) or len(sub_k) > 32:
-                        raise RetrievalContractError("Nested filter operator key invalid")
+        if not isinstance(key, str) or not _FILTER_KEY_PATTERN.match(key):
+            raise RetrievalContractError("Invalid filter metadata key format")
+        if isinstance(val, dict):
+            # Operator dict: only $eq, $ne, $in
+            for op, op_val in val.items():
+                if op not in _SUPPORTED_FILTER_OPERATORS:
+                    raise RetrievalContractError("Unsupported filter operator in metadata query")
+                if op == "$in":
+                    if not isinstance(op_val, (list, tuple, set)):
+                        raise RetrievalContractError("$in operator expects a list")
+                    if len(op_val) > MAX_FILTER_IN_ITEMS:
+                        raise RetrievalContractError("$in operator exceeds maximum allowed items")
+                elif op in ("$eq", "$ne") and isinstance(op_val, (dict, list)):
+                    raise RetrievalContractError("Nested complex value not supported for operator")
+        elif isinstance(val, list):
+            raise RetrievalContractError("Direct list value not supported without operator")
 
 
-def _is_zero_vector(vec: tuple[float, ...] | list[float], eps: float = 1e-12) -> bool:
-    """Check if vector is zero (norm close to 0) which causes degenerate cosine distances."""
-    norm_sq = sum(x * x for x in vec)
-    return norm_sq < eps
+def _is_zero_vector(vec: tuple[float, ...] | list[float]) -> bool:
+    """Check if vector is an exact zero vector (all elements equal 0.0).
+
+    Does not falsely reject tiny valid finite embeddings with small norms.
+    """
+    return all(x == 0.0 for x in vec)
 
 
 class IngestionService:
     """Deterministic, injected EmbeddingProvider + VectorIndex orchestration service.
 
-    Guarantees:
-    - Multi-tenant isolation: caller must provide authenticated tenant_id.
-    - Strict input bounds: maximum document length, batch sizing, chunk count.
-    - Embeddings validation: vector dimension, finite values, non-zero cosine safety.
-    - Deterministic chunk IDs and stable tenant document IDs.
-    - Safe query helper with top_k clamping and tenant scoping.
+    Authorization Contract:
+    - Caller tenant identity MUST be authenticated and resolved by the caller.
+    - This service does not perform standalone caller authentication; it enforces multi-tenant
+      isolation based on the verified tenant_id parameter provided by the caller.
+    - Fails closed on cross-tenant search responses or mismatched tenant documents.
     """
 
     def __init__(
@@ -267,7 +287,7 @@ class IngestionService:
         """Ingest, chunk, embed, and idempotently upsert documents for a specific tenant.
 
         Args:
-            tenant_id: Verified tenant identifier.
+            tenant_id: Verified caller tenant identifier.
             documents: List of IngestionDocument instances.
 
         Returns:
@@ -275,18 +295,15 @@ class IngestionService:
 
         Raises:
             RetrievalContractError: If boundaries, formats, dimensions, or tenant isolation are violated.
+            RetrievalError: Generic unchained error if embedding provider call fails.
         """
         valid_tenant = validate_tenant_scope(tenant_id)
 
         if not isinstance(documents, list):
-            raise RetrievalContractError(
-                f"documents must be a list, got {type(documents).__name__}"
-            )
+            raise RetrievalContractError("documents must be a list")
 
         if len(documents) > self._config.max_documents_per_batch:
-            raise RetrievalContractError(
-                f"Document batch count ({len(documents)}) exceeds limit ({self._config.max_documents_per_batch})"
-            )
+            raise RetrievalContractError("Document batch count exceeds limit")
 
         if not documents:
             return IngestionResult(
@@ -299,15 +316,11 @@ class IngestionService:
 
         # 1. Validation & Chunking
         seen_doc_ids: set[str] = set()
-        all_chunks: list[
-            tuple[str, TextChunk, dict[str, Any]]
-        ] = []  # (raw_doc_id, chunk, safe_metadata)
+        all_chunks: list[tuple[str, TextChunk, dict[str, Any]]] = []
 
         for doc in documents:
             if not isinstance(doc, IngestionDocument):
-                raise RetrievalContractError(
-                    f"Expected IngestionDocument instance, got {type(doc).__name__}"
-                )
+                raise RetrievalContractError("Expected IngestionDocument instance")
             if not doc.document_id or not isinstance(doc.document_id, str):
                 raise RetrievalContractError(
                     "IngestionDocument document_id must be a non-empty string"
@@ -315,25 +328,19 @@ class IngestionService:
 
             clean_doc_id = doc.document_id.strip()
             if clean_doc_id in seen_doc_ids:
-                raise RetrievalContractError(f"Duplicate document_id in batch: '{clean_doc_id}'")
+                raise RetrievalContractError("Duplicate document_id in batch")
             seen_doc_ids.add(clean_doc_id)
 
             if len(clean_doc_id) > MAX_DOCUMENT_ID_LENGTH or not _DOC_ID_ALLOWED_RE.match(
                 clean_doc_id
             ):
-                raise RetrievalContractError(
-                    f"Invalid or disallowed characters in document_id '{clean_doc_id}'"
-                )
+                raise RetrievalContractError("Invalid or disallowed characters in document_id")
 
             if not isinstance(doc.text, str):
-                raise RetrievalContractError(
-                    f"Document text must be string, got {type(doc.text).__name__}"
-                )
+                raise RetrievalContractError("Document text must be a string")
 
             if len(doc.text) > MAX_TEXT_CONTENT_LENGTH:
-                raise RetrievalContractError(
-                    f"Document text length ({len(doc.text)}) exceeds limit ({MAX_TEXT_CONTENT_LENGTH})"
-                )
+                raise RetrievalContractError("Document text length exceeds limit")
 
             safe_meta = sanitize_and_validate_metadata(doc.metadata or {})
 
@@ -349,9 +356,7 @@ class IngestionService:
                 all_chunks.append((clean_doc_id, chunk, safe_meta))
 
         if len(all_chunks) > self._config.max_chunks_per_ingest:
-            raise RetrievalContractError(
-                f"Total chunks created ({len(all_chunks)}) exceeds safety limit ({self._config.max_chunks_per_ingest})"
-            )
+            raise RetrievalContractError("Total chunks created exceeds safety limit")
 
         if not all_chunks:
             return IngestionResult(
@@ -371,16 +376,14 @@ class IngestionService:
             batch_slice = chunk_texts[i : i + batch_size]
             try:
                 batch_vectors = self._embedding_provider.embed_texts(batch_slice)
-            except Exception as err:
+            except Exception:
+                # Privacy: fail closed with generic error unchained from provider internals
                 raise RetrievalError(
                     "Embedding provider call failed during batch processing"
-                ) from err
+                ) from None
 
             if not isinstance(batch_vectors, list) or len(batch_vectors) != len(batch_slice):
-                raise RetrievalContractError(
-                    f"Embedding provider returned {len(batch_vectors) if isinstance(batch_vectors, list) else 'invalid'} "
-                    f"vectors, expected {len(batch_slice)}"
-                )
+                raise RetrievalContractError("Embedding provider returned mismatched vector count")
 
             for vec in batch_vectors:
                 validate_embedding_vector(vec, expected_dimension=self._config.expected_dimension)
@@ -411,6 +414,9 @@ class IngestionService:
                 "end_offset": chunk.end_offset,
                 "chunk_id": chunk.chunk_id,
             }
+
+            # Validate metadata including provenance
+            sanitize_and_validate_metadata(doc_meta)
 
             v_doc = VectorDocument(
                 id=stable_doc_id,
@@ -461,17 +467,18 @@ class IngestionService:
         """Query the vector index with text by generating embeddings and executing a tenant-safe search.
 
         Args:
-            tenant_id: Verified tenant identifier.
+            tenant_id: Verified caller tenant identifier.
             query_text: Raw query text.
-            top_k: Number of results to retrieve.
-            score_threshold: Optional similarity score threshold.
-            filter_metadata: Optional key-value filter metadata.
+            top_k: Number of results to retrieve (must be strict positive integer).
+            score_threshold: Optional similarity score threshold (must be finite float/int).
+            filter_metadata: Optional key-value filter metadata matching pgvector semantics.
 
         Returns:
             List of SearchResult items verified for tenant isolation and sorting.
 
         Raises:
             RetrievalContractError: If query parameters, filters, or returned results violate contracts.
+            RetrievalError: Generic unchained error if embedding generation fails.
         """
         valid_tenant = validate_tenant_scope(tenant_id)
 
@@ -479,15 +486,20 @@ class IngestionService:
             raise RetrievalContractError("query_text must be a non-empty string")
 
         if len(query_text) > MAX_TEXT_CONTENT_LENGTH:
-            raise RetrievalContractError(
-                f"query_text length ({len(query_text)}) exceeds maximum allowed limit"
-            )
+            raise RetrievalContractError("query_text length exceeds maximum allowed limit")
 
-        if top_k < 1:
-            raise RetrievalContractError(f"top_k must be >= 1, got {top_k}")
-
+        # Validate top_k strictly
+        _validate_strict_int(top_k, "top_k", min_val=1)
         bounded_top_k = min(top_k, self._config.max_top_k)
 
+        # Validate score_threshold strictly before any external calls
+        if score_threshold is not None:
+            if isinstance(score_threshold, bool) or not isinstance(score_threshold, (int, float)):
+                raise RetrievalContractError("score_threshold must be a numeric value")
+            if not math.isfinite(score_threshold):
+                raise RetrievalContractError("score_threshold must be a finite float")
+
+        # Validate filter_metadata before external calls
         if filter_metadata is not None:
             validate_query_filter_bounds(filter_metadata)
             safe_filters = sanitize_and_validate_metadata(filter_metadata)
@@ -497,8 +509,9 @@ class IngestionService:
         # Generate query embedding
         try:
             vectors = self._embedding_provider.embed_texts([query_text])
-        except Exception as err:
-            raise RetrievalError("Failed to generate embedding for query") from err
+        except Exception:
+            # Privacy: unchain provider error to prevent secret/prompt leaks
+            raise RetrievalError("Failed to generate embedding for query") from None
 
         if not isinstance(vectors, list) or len(vectors) != 1:
             raise RetrievalContractError("Embedding provider returned invalid vectors for query")
@@ -520,9 +533,7 @@ class IngestionService:
         results = self._vector_index.search(bundle)
 
         if not isinstance(results, list):
-            raise RetrievalContractError(
-                f"VectorIndex search returned {type(results).__name__}, expected list"
-            )
+            raise RetrievalContractError("VectorIndex search returned invalid result type")
 
         # Validate that results strictly adhere to caller's tenant_id and invariants
         validate_search_results(results, expected_tenant_id=valid_tenant)

@@ -344,5 +344,5 @@ def test_query_filter_bounds():
     with pytest.raises(RetrievalContractError, match="maximum allowed filter keys"):
         validate_query_filter_bounds({f"k_{i}": i for i in range(25)})
 
-    with pytest.raises(RetrievalContractError, match="exceeds max items"):
-        validate_query_filter_bounds({"tag": list(range(105))})
+    with pytest.raises(RetrievalContractError, match="exceeds maximum allowed items"):
+        validate_query_filter_bounds({"tag": {"$in": list(range(105))}})
