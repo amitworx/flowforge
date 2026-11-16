@@ -167,20 +167,25 @@ class InMemoryBudgetRepository:
 
             if existing_id:
                 existing = self._reservations[existing_id]
+                # Strict parameter comparison: scope, provider, model, prompt tokens, completion tokens, cost, attempt
                 if (
                     existing.scope.key == scope.key
                     and existing.provider == provider
                     and existing.model == model
+                    and existing.estimated_prompt_tokens == estimated_prompt_tokens
+                    and existing.estimated_completion_tokens == estimated_completion_tokens
                     and existing.estimated_total_tokens == estimated_total_tokens
+                    and existing.estimated_cost_micros == estimated_cost_micros
+                    and existing.attempt_number == attempt_number
                 ):
                     return (existing, True)
                 raise AIDuplicateSettlementError(
                     existing_id,
-                    f"Idempotency key '{idempotency_key}' reused with conflicting reservation parameters",
+                    "Idempotency key reused with conflicting reservation parameters",
                 )
 
             if reservation_id in self._reservations:
-                raise AIGovernanceError(f"Reservation ID '{reservation_id}' already exists")
+                raise AIGovernanceError("Reservation identifier already exists")
 
             # Check limits across scope and all ancestor scopes under this exact lock!
             scopes_to_check = [scope, *ancestor_scopes]
@@ -197,7 +202,7 @@ class InMemoryBudgetRepository:
                     and settled_calls + res_calls + 1 > settings.max_calls
                 ):
                     raise AIBudgetExhaustedError(
-                        f"Scope '{s.key}' exceeded max_calls ({settings.max_calls})",
+                        "Budget limit for max calls exceeded",
                         limit_name="max_calls",
                         requested_value=1,
                         current_value=settled_calls + res_calls,
@@ -211,7 +216,7 @@ class InMemoryBudgetRepository:
                     > settings.max_total_tokens
                 ):
                     raise AIBudgetExhaustedError(
-                        f"Scope '{s.key}' exceeded max_total_tokens ({settings.max_total_tokens}) by estimated request ({estimated_total_tokens})",
+                        "Budget limit for total tokens exceeded by estimated request",
                         limit_name="max_total_tokens",
                         requested_value=estimated_total_tokens,
                         current_value=settled_tokens + res_tokens,
@@ -225,7 +230,7 @@ class InMemoryBudgetRepository:
                     > settings.max_estimated_cost_micros
                 ):
                     raise AIBudgetExhaustedError(
-                        f"Scope '{s.key}' exceeded max_estimated_cost_micros ({settings.max_estimated_cost_micros}) by estimated cost ({estimated_cost_micros})",
+                        "Budget limit for estimated cost exceeded",
                         limit_name="max_estimated_cost_micros",
                         requested_value=estimated_cost_micros,
                         current_value=settled_cost + res_cost,
@@ -382,15 +387,23 @@ class InMemoryBudgetRepository:
 
             if existing_s_id:
                 existing = self._settlements[existing_s_id]
+                # Strict comparison across all settlement fields
                 if (
                     existing.reservation_id == reservation_id
+                    and existing.actual_prompt_tokens == actual_prompt_tokens
+                    and existing.actual_completion_tokens == actual_completion_tokens
                     and existing.actual_total_tokens == actual_total_tokens
+                    and existing.actual_cost_micros == actual_cost_micros
                     and existing.settlement_type == settlement_type
+                    and existing.attempt_number == attempt_number
+                    and existing.overrun_marker == overrun_marker
+                    and existing.overrun_tokens == overrun_tokens
+                    and existing.overrun_cost_micros == overrun_cost_micros
                 ):
                     return (existing, True)
                 raise AIDuplicateSettlementError(
                     reservation_id,
-                    f"Conflicting settlement parameters for idempotency key '{idempotency_key}'",
+                    "Conflicting settlement parameters for idempotency key",
                 )
 
             # Check if reservation is already settled
@@ -400,7 +413,12 @@ class InMemoryBudgetRepository:
                     existing = self._settlements[existing_s_id]
                     if (
                         existing.idempotency_key == idempotency_key
+                        and existing.actual_prompt_tokens == actual_prompt_tokens
+                        and existing.actual_completion_tokens == actual_completion_tokens
                         and existing.actual_total_tokens == actual_total_tokens
+                        and existing.actual_cost_micros == actual_cost_micros
+                        and existing.settlement_type == settlement_type
+                        and existing.attempt_number == attempt_number
                     ):
                         return (existing, True)
                 raise AIDuplicateSettlementError(reservation_id)

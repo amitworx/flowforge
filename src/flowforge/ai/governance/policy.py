@@ -8,7 +8,7 @@ Enforces:
 5. Truthful overrun recording when actual token consumption exceeds bounds.
 6. Pluggable clock for deterministic testing (no implicit wall-clock time).
 7. Cross-tenant isolation and scoped idempotency.
-8. Privacy: allowlisted bounded metadata fields, no raw prompts, secret keys, or provider responses stored.
+8. Privacy: allowlisted bounded metadata fields, sanitized ledger notes, no raw prompts or secret keys stored.
 """
 
 from __future__ import annotations
@@ -55,35 +55,33 @@ class AIBudgetPolicyService:
         """Check provider authorization against budget settings across all hierarchy levels.
 
         Deny-by-default hosted policy:
-        If settings are defined at scope or any ancestor level, provider must be explicitly
-        in allowed_providers and must not be in denied_providers.
+        1. If explicitly denied at ANY hierarchy level -> denied immediately.
+        2. Safe local/mock providers ('mock', 'ollama', 'test') are allowed unless explicitly denied.
+        3. External hosted providers must be explicitly allowed by at least one scope's allowed_providers.
         """
         scopes_to_check = [scope, *scope.get_ancestor_scopes()]
-        found_settings = False
+        explicitly_allowed = False
+        default_safe = ("mock", "ollama", "test")
 
         for s in scopes_to_check:
             settings = self._repo.get_budget_settings(s)
             if settings is not None:
-                found_settings = True
                 if provider in settings.denied_providers:
                     raise AIProviderPolicyDeniedError(
                         provider,
-                        f"Provider '{provider}' is explicitly denied in budget settings for scope '{s.key}'",
+                        "Provider is explicitly denied in budget policy",
                     )
-                if provider not in settings.allowed_providers:
-                    raise AIProviderPolicyDeniedError(
-                        provider,
-                        f"Provider '{provider}' is not authorized in allowed providers for scope '{s.key}'",
-                    )
+                if provider in settings.allowed_providers:
+                    explicitly_allowed = True
 
-        if not found_settings:
-            # Deny-by-default for hosted external providers when no settings defined
-            default_safe = ("mock", "ollama", "test")
-            if provider not in default_safe:
-                raise AIProviderPolicyDeniedError(
-                    provider,
-                    f"Hosted provider '{provider}' denied by default (no explicit budget policy authorizes it)",
-                )
+        if provider in default_safe:
+            return
+
+        if not explicitly_allowed:
+            raise AIProviderPolicyDeniedError(
+                provider,
+                "Hosted provider denied by default (not authorized in budget policy)",
+            )
 
     def reserve(
         self,
@@ -120,14 +118,6 @@ class AIBudgetPolicyService:
             raise AIGovernanceError("estimated_cost_micros must be a non-negative integer")
 
         estimated_total_tokens = estimated_prompt_tokens + estimated_completion_tokens
-
-        # Check existing reservation by idempotency key
-        if idempotency_key:
-            existing = self._repo.get_reservation_by_idempotency_key(idempotency_key, scope=scope)
-            if existing:
-                if existing.scope.tenant_id != scope.tenant_id:
-                    raise AIGovernanceError("Idempotency key reused across different tenant")
-                return existing
 
         # 1. Deny-by-default provider policy check across hierarchy
         self.evaluate_provider_policy(scope, provider)
@@ -189,15 +179,7 @@ class AIBudgetPolicyService:
         """Atomically settle a completed or failed reservation."""
         res = self._repo.get_reservation_by_id(reservation_id)
         if not res:
-            raise AIGovernanceError(f"Reservation '{reservation_id}' not found")
-
-        # Check existing settlement by idempotency key
-        if idempotency_key:
-            existing = self._repo.get_settlement_by_idempotency_key(
-                idempotency_key, scope=res.scope
-            )
-            if existing:
-                return existing
+            raise AIGovernanceError("Reservation not found")
 
         now = self._now()
         idem_key = idempotency_key or f"settle-{reservation_id}-{attempt_number}"
@@ -376,7 +358,7 @@ class AIBudgetPolicyService:
         now = self._now()
         res = self._repo.get_reservation_by_id(reservation_id)
         if not res:
-            raise AIGovernanceError(f"Reservation '{reservation_id}' not found")
+            raise AIGovernanceError("Reservation not found")
 
         idem_key = idempotency_key or f"release-{reservation_id}"
         ledger_entry = UsageLedgerEntry(

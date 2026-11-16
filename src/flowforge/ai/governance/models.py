@@ -7,6 +7,7 @@ are held in these records. All timestamps are UTC aware.
 from __future__ import annotations
 
 import datetime
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -46,12 +47,28 @@ def sanitize_audit_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str
         if key_str in ALLOWED_AUDIT_METADATA_KEYS and v is not None:
             # Bound value string length to 256 chars max
             val_str = str(v)[:256]
-            # Extra safety: reject obvious secret indicators
             lower_val = val_str.lower()
-            if "bearer " in lower_val or "sk-" in lower_val or "secret" in lower_val:
+            if (
+                "bearer " in lower_val
+                or "sk-" in lower_val
+                or "secret" in lower_val
+                or "token" in lower_val
+            ):
                 continue
             clean[key_str] = val_str
     return clean
+
+
+def sanitize_note(note: str) -> str:
+    """Sanitizes ledger notes to guarantee no raw secrets, keys, or arbitrary caller data are retained."""
+    if not note:
+        return ""
+    # Truncate and strip sensitive prefixes/substrings
+    lower_note = note.lower()
+    for sensitive_sub in ("bearer ", "sk-", "secret", "token", "password", "prompt"):
+        if sensitive_sub in lower_note:
+            return "Sanitized note (sensitive content removed)"
+    return note[:256]
 
 
 class BudgetScopeType(StrEnum):
@@ -79,7 +96,7 @@ class BudgetScope:
             try:
                 object.__setattr__(self, "scope_type", BudgetScopeType(self.scope_type))
             except ValueError as err:
-                raise AIGovernanceError(f"Invalid scope_type: {self.scope_type}") from err
+                raise AIGovernanceError("Invalid scope_type specified") from err
 
         # Validation rules:
         if self.scope_type == BudgetScopeType.TENANT and not self.tenant_id:
@@ -150,8 +167,8 @@ class BudgetSettings:
     )
 
     def __post_init__(self) -> None:
-        if not isinstance(self.version, int) or self.version <= 0:
-            raise AIGovernanceError("version must be a positive integer")
+        if isinstance(self.version, bool) or not isinstance(self.version, int) or self.version <= 0:
+            raise AIGovernanceError("version must be a positive integer, not bool")
 
         for name, val in [
             ("max_calls", self.max_calls),
@@ -167,8 +184,12 @@ class BudgetSettings:
             isinstance(self.max_duration_seconds, bool)
             or not isinstance(self.max_duration_seconds, (int, float))
             or self.max_duration_seconds < 0
+            or math.isnan(self.max_duration_seconds)
+            or math.isinf(self.max_duration_seconds)
         ):
-            raise AIGovernanceError("max_duration_seconds must be non-negative float or None")
+            raise AIGovernanceError(
+                "max_duration_seconds must be a non-negative finite float or None"
+            )
 
         # Normalize provider tuples
         if not isinstance(self.allowed_providers, tuple):
@@ -284,8 +305,10 @@ class SettlementRecord:
             isinstance(self.duration_seconds, bool)
             or not isinstance(self.duration_seconds, (int, float))
             or self.duration_seconds < 0
+            or math.isnan(self.duration_seconds)
+            or math.isinf(self.duration_seconds)
         ):
-            raise AIGovernanceError("duration_seconds must be a non-negative float")
+            raise AIGovernanceError("duration_seconds must be a non-negative finite float")
         object.__setattr__(self, "audit_metadata", sanitize_audit_metadata(self.audit_metadata))
 
 
@@ -311,3 +334,4 @@ class UsageLedgerEntry:
         if self.timestamp.tzinfo is None:
             raise AIGovernanceError("timestamp must be timezone-aware (UTC)")
         object.__setattr__(self, "audit_metadata", sanitize_audit_metadata(self.audit_metadata))
+        object.__setattr__(self, "notes", sanitize_note(self.notes))

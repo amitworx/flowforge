@@ -2,6 +2,7 @@
 
 Strict fail-closed exceptions. Never exposes secrets, raw prompts, provider responses,
 or sensitive API credentials in exception messages or representations.
+Uses fixed generic allowlisted reason codes.
 """
 
 from collections.abc import Mapping
@@ -11,16 +12,23 @@ from typing import Any
 class AIGovernanceError(Exception):
     """Base exception for all AI governance, budget, and audit errors."""
 
-    def __init__(self, message: str, *, details: Mapping[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        message: str = "AI governance error",
+        *,
+        code: str = "GOVERNANCE_ERROR",
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
+        self.code = code
         self.details = dict(details) if details else {}
 
     def __str__(self) -> str:
         return self.message
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(message={self.message!r})"
+        return f"{self.__class__.__name__}(code={self.code!r}, message={self.message!r})"
 
 
 class AIBudgetExhaustedError(AIGovernanceError):
@@ -28,12 +36,12 @@ class AIBudgetExhaustedError(AIGovernanceError):
 
     def __init__(
         self,
-        message: str,
+        message: str = "AI budget limit exhausted",
         *,
-        limit_name: str,
-        requested_value: int | float,
-        current_value: int | float,
-        limit_value: int | float,
+        limit_name: str = "budget_limit",
+        requested_value: int | float = 0,
+        current_value: int | float = 0,
+        limit_value: int | float = 0,
         scope_key: str | None = None,
     ) -> None:
         details = {
@@ -44,7 +52,7 @@ class AIBudgetExhaustedError(AIGovernanceError):
         }
         if scope_key:
             details["scope_key"] = scope_key
-        super().__init__(message, details=details)
+        super().__init__(message, code="BUDGET_EXHAUSTED", details=details)
         self.limit_name = limit_name
         self.requested_value = requested_value
         self.current_value = current_value
@@ -55,32 +63,38 @@ class AIBudgetExhaustedError(AIGovernanceError):
 class AIReservationNotFoundError(AIGovernanceError):
     """Raised when operating on a reservation ID that does not exist."""
 
-    def __init__(self, reservation_id: str) -> None:
+    def __init__(self, reservation_id: str = "") -> None:
         super().__init__(
-            f"Reservation '{reservation_id}' not found",
-            details={"reservation_id": reservation_id},
+            "Reservation not found",
+            code="RESERVATION_NOT_FOUND",
+            details={"reservation_id": reservation_id} if reservation_id else {},
         )
         self.reservation_id = reservation_id
 
 
 class AIDuplicateSettlementError(AIGovernanceError):
-    """Raised when attempting to settle a reservation that has already been settled
+    """Raised when attempting duplicate or conflicting reservation / settlement operations."""
 
-    with conflicting details, or re-settling an already finalized reservation.
-    """
-
-    def __init__(self, reservation_id: str, message: str | None = None) -> None:
-        msg = message or f"Reservation '{reservation_id}' has already been settled"
-        super().__init__(msg, details={"reservation_id": reservation_id})
+    def __init__(
+        self, reservation_id: str = "", message: str = "Duplicate or conflicting settlement"
+    ) -> None:
+        super().__init__(
+            message,
+            code="DUPLICATE_OR_CONFLICTING_OPERATION",
+            details={"reservation_id": reservation_id} if reservation_id else {},
+        )
         self.reservation_id = reservation_id
 
 
 class AIInvalidReservationStateError(AIGovernanceError):
     """Raised when an operation is invalid for the current reservation status."""
 
-    def __init__(self, reservation_id: str, current_status: str, attempted_action: str) -> None:
+    def __init__(
+        self, reservation_id: str = "", current_status: str = "", attempted_action: str = ""
+    ) -> None:
         super().__init__(
-            f"Cannot {attempted_action} reservation '{reservation_id}' in status '{current_status}'",
+            f"Invalid reservation state for {attempted_action or 'operation'}",
+            code="INVALID_RESERVATION_STATE",
             details={
                 "reservation_id": reservation_id,
                 "current_status": current_status,
@@ -93,13 +107,16 @@ class AIInvalidReservationStateError(AIGovernanceError):
 
 
 class AIProviderPolicyDeniedError(AIGovernanceError):
-    """Raised fail-closed when a provider is not explicitly permitted under hosted policy."""
+    """Raised fail-closed when a provider is not explicitly permitted under policy."""
 
     def __init__(
-        self, provider: str, reason: str = "Provider not allowed by governance policy"
+        self,
+        provider: str = "",
+        reason: str = "denied by default (not authorized in budget policy)",
     ) -> None:
         super().__init__(
-            f"Provider '{provider}' denied: {reason}",
+            f"Provider access denied: {reason}",
+            code="PROVIDER_POLICY_DENIED",
             details={"provider": provider, "reason": reason},
         )
         self.provider = provider
@@ -107,11 +124,14 @@ class AIProviderPolicyDeniedError(AIGovernanceError):
 
 
 class AIStaleFencedAttemptError(AIGovernanceError):
-    """Raised when an operation presents a stale fencing token or attempt number."""
+    """Raised when an operation presents a stale or mismatched fencing attempt."""
 
-    def __init__(self, reservation_id: str, expected_attempt: int, actual_attempt: int) -> None:
+    def __init__(
+        self, reservation_id: str = "", expected_attempt: int = 0, actual_attempt: int = 0
+    ) -> None:
         super().__init__(
-            f"Stale attempt {actual_attempt} for reservation '{reservation_id}' (expected {expected_attempt})",
+            "Mismatched or stale attempt fencing token",
+            code="FENCING_ATTEMPT_MISMATCH",
             details={
                 "reservation_id": reservation_id,
                 "expected_attempt": expected_attempt,
