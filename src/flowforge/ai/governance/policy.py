@@ -69,7 +69,7 @@ class AIBudgetPolicyService:
                 if provider in settings.denied_providers:
                     raise AIProviderPolicyDeniedError(
                         provider,
-                        "Provider is explicitly denied in budget policy",
+                        reason="provider_explicitly_denied",
                     )
                 if provider in settings.allowed_providers:
                     explicitly_allowed = True
@@ -80,7 +80,7 @@ class AIBudgetPolicyService:
         if not explicitly_allowed:
             raise AIProviderPolicyDeniedError(
                 provider,
-                "Hosted provider denied by default (not authorized in budget policy)",
+                reason="provider_denied_by_default",
             )
 
     def reserve(
@@ -302,8 +302,7 @@ class AIBudgetPolicyService:
                     ledger_entry=ledger_entry,
                 )
                 raise AIBudgetExhaustedError(
-                    f"Settlement resulted in budget overrun ({overrun_marker.value}): "
-                    f"{overrun_tokens} tokens over limit",
+                    f"Settlement resulted in budget overrun ({overrun_marker.value})",
                     limit_name="max_total_tokens",
                     requested_value=final_total,
                     current_value=projected_tokens,
@@ -352,7 +351,7 @@ class AIBudgetPolicyService:
         *,
         reservation_id: str,
         idempotency_key: str | None = None,
-        reason: str = "Released without usage",
+        reason: str = "released_without_usage",
     ) -> ReservationRecord:
         """Release reservation without incurring cost or token usage."""
         now = self._now()

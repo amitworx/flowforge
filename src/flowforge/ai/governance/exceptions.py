@@ -2,19 +2,38 @@
 
 Strict fail-closed exceptions. Never exposes secrets, raw prompts, provider responses,
 caller identifiers, or sensitive credentials in exception messages, attributes, or details.
-Uses fixed generic allowlisted reason codes and opaque references.
+Uses fixed generic allowlisted reason codes and safe policy metrics.
 """
 
-import hashlib
 from collections.abc import Mapping
 from typing import Any
 
+# Allowlisted, fixed reason and action codes
+ALLOWED_ACTION_CODES = frozenset({"reserve", "settle", "release", "expire", "unknown_action"})
+ALLOWED_REASON_CODES = frozenset(
+    {
+        "provider_denied_by_default",
+        "provider_explicitly_denied",
+        "provider_not_authorized",
+        "policy_denied",
+    }
+)
 
-def _opaque_ref(val: str | None) -> str:
-    """Produces a non-reversible opaque reference hash for debugging without leaking raw IDs or secrets."""
-    if not val:
-        return ""
-    return hashlib.sha256(val.encode("utf-8")).hexdigest()[:12]
+
+def _safe_action_code(action: str | None) -> str:
+    """Returns an allowlisted action code, mapping unknown caller inputs to 'unknown_action'."""
+    if not action:
+        return "unknown_action"
+    cleaned = action.lower().strip()
+    return cleaned if cleaned in ALLOWED_ACTION_CODES else "unknown_action"
+
+
+def _safe_reason_code(reason: str | None) -> str:
+    """Returns an allowlisted reason code, mapping unknown caller inputs to 'policy_denied'."""
+    if not reason:
+        return "policy_denied"
+    cleaned = reason.lower().strip()
+    return cleaned if cleaned in ALLOWED_REASON_CODES else "policy_denied"
 
 
 class AIGovernanceError(Exception):
@@ -52,33 +71,30 @@ class AIBudgetExhaustedError(AIGovernanceError):
         limit_value: int | float = 0,
         scope_key: str | None = None,
     ) -> None:
+        del scope_key
         details = {
             "limit_name": limit_name,
             "requested_value": requested_value,
             "current_value": current_value,
             "limit_value": limit_value,
         }
-        if scope_key:
-            details["scope_ref"] = _opaque_ref(scope_key)
         super().__init__(message, code="BUDGET_EXHAUSTED", details=details)
         self.limit_name = limit_name
         self.requested_value = requested_value
         self.current_value = current_value
         self.limit_value = limit_value
-        self.scope_ref = _opaque_ref(scope_key) if scope_key else ""
 
 
 class AIReservationNotFoundError(AIGovernanceError):
     """Raised when operating on a reservation ID that does not exist."""
 
     def __init__(self, reservation_id: str = "") -> None:
-        opaque_id = _opaque_ref(reservation_id)
+        del reservation_id
         super().__init__(
             "Reservation not found",
             code="RESERVATION_NOT_FOUND",
-            details={"reservation_ref": opaque_id} if opaque_id else {},
+            details={},
         )
-        self.reservation_ref = opaque_id
 
 
 class AIDuplicateSettlementError(AIGovernanceError):
@@ -87,13 +103,12 @@ class AIDuplicateSettlementError(AIGovernanceError):
     def __init__(
         self, reservation_id: str = "", message: str = "Duplicate or conflicting operation"
     ) -> None:
-        opaque_id = _opaque_ref(reservation_id)
+        del reservation_id
         super().__init__(
             message,
             code="DUPLICATE_OR_CONFLICTING_OPERATION",
-            details={"reservation_ref": opaque_id} if opaque_id else {},
+            details={},
         )
-        self.reservation_ref = opaque_id
 
 
 class AIInvalidReservationStateError(AIGovernanceError):
@@ -102,19 +117,19 @@ class AIInvalidReservationStateError(AIGovernanceError):
     def __init__(
         self, reservation_id: str = "", current_status: str = "", attempted_action: str = ""
     ) -> None:
-        opaque_id = _opaque_ref(reservation_id)
+        del reservation_id
+        safe_action = _safe_action_code(attempted_action)
+        safe_status = current_status.lower().strip() if current_status else "unknown"
         super().__init__(
-            f"Invalid reservation state for {attempted_action or 'operation'}",
+            "Invalid reservation state for requested operation",
             code="INVALID_RESERVATION_STATE",
             details={
-                "reservation_ref": opaque_id,
-                "current_status": current_status,
-                "attempted_action": attempted_action,
+                "current_status": safe_status,
+                "action_code": safe_action,
             },
         )
-        self.reservation_ref = opaque_id
-        self.current_status = current_status
-        self.attempted_action = attempted_action
+        self.current_status = safe_status
+        self.action_code = safe_action
 
 
 class AIProviderPolicyDeniedError(AIGovernanceError):
@@ -123,16 +138,21 @@ class AIProviderPolicyDeniedError(AIGovernanceError):
     def __init__(
         self,
         provider: str = "",
-        reason: str = "denied by default (not authorized in budget policy)",
+        reason: str = "provider_denied_by_default",
     ) -> None:
-        opaque_p = _opaque_ref(provider)
-        super().__init__(
-            f"Provider access denied: {reason}",
-            code="PROVIDER_POLICY_DENIED",
-            details={"provider_ref": opaque_p, "reason": reason},
+        del provider
+        safe_reason = _safe_reason_code(reason)
+        msg = (
+            "Provider denied by default (not authorized in budget policy)"
+            if safe_reason == "provider_denied_by_default"
+            else "Provider access denied by governance policy"
         )
-        self.provider_ref = opaque_p
-        self.reason = reason
+        super().__init__(
+            msg,
+            code="PROVIDER_POLICY_DENIED",
+            details={"reason_code": safe_reason},
+        )
+        self.reason_code = safe_reason
 
 
 class AIStaleFencedAttemptError(AIGovernanceError):
@@ -141,16 +161,14 @@ class AIStaleFencedAttemptError(AIGovernanceError):
     def __init__(
         self, reservation_id: str = "", expected_attempt: int = 0, actual_attempt: int = 0
     ) -> None:
-        opaque_id = _opaque_ref(reservation_id)
+        del reservation_id
         super().__init__(
             "Mismatched or stale attempt fencing token",
             code="FENCING_ATTEMPT_MISMATCH",
             details={
-                "reservation_ref": opaque_id,
                 "expected_attempt": expected_attempt,
                 "actual_attempt": actual_attempt,
             },
         )
-        self.reservation_ref = opaque_id
         self.expected_attempt = expected_attempt
         self.actual_attempt = actual_attempt
