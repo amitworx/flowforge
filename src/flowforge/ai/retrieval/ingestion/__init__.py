@@ -42,7 +42,7 @@ DEFAULT_BATCH_SIZE: int = 64
 DEFAULT_MAX_TOP_K: int = 100
 _DOC_ID_ALLOWED_RE = re.compile(r"^[a-zA-Z0-9_\-\.:#]+$")
 _FILTER_KEY_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_\.]{0,63}$")
-_SUPPORTED_FILTER_OPERATORS = {"$eq", "$in", "$ne"}
+_SUPPORTED_FILTER_OPERATORS = {"$eq", "$ne", "$in"}
 
 
 def _validate_strict_int(
@@ -196,10 +196,15 @@ def sanitize_and_validate_metadata(
 
     _check_depth(metadata, 1)
 
+    encoded = None
     try:
         encoded = json.dumps(metadata, separators=(",", ":"), ensure_ascii=True)
     except (TypeError, ValueError):
-        raise RetrievalContractError("Metadata is not JSON-serializable") from None
+        err = RetrievalContractError("Metadata is not JSON-serializable")
+    if encoded is None:
+        err.__cause__ = None
+        err.__context__ = None
+        raise err
 
     if len(encoded.encode("utf-8")) > max_size:
         raise RetrievalContractError("Metadata size exceeds maximum limit")
@@ -226,10 +231,17 @@ def validate_query_filter_bounds(filter_metadata: dict[str, Any]) -> None:
                         raise RetrievalContractError("$in operator expects a list")
                     if len(op_val) > MAX_FILTER_IN_ITEMS:
                         raise RetrievalContractError("$in operator exceeds maximum allowed items")
-                elif op in ("$eq", "$ne") and isinstance(op_val, (dict, list)):
+                    for elem in op_val:
+                        if isinstance(elem, (dict, list, set, tuple)):
+                            raise RetrievalContractError(
+                                "Elements in $in list must be scalar values"
+                            )
+                elif op in ("$eq", "$ne") and isinstance(op_val, (dict, list, set, tuple)):
                     raise RetrievalContractError("Nested complex value not supported for operator")
-        elif isinstance(val, list):
-            raise RetrievalContractError("Direct list value not supported without operator")
+        elif isinstance(val, (dict, list, set, tuple)):
+            raise RetrievalContractError(
+                "Direct list/dict value not supported without valid operator"
+            )
 
 
 def _is_zero_vector(vec: tuple[float, ...] | list[float]) -> bool:
@@ -295,7 +307,7 @@ class IngestionService:
 
         Raises:
             RetrievalContractError: If boundaries, formats, dimensions, or tenant isolation are violated.
-            RetrievalError: Generic unchained error if embedding provider call fails.
+            RetrievalError: Generic unchained error if embedding provider or vector index fails.
         """
         valid_tenant = validate_tenant_scope(tenant_id)
 
@@ -374,13 +386,15 @@ class IngestionService:
 
         for i in range(0, len(chunk_texts), batch_size):
             batch_slice = chunk_texts[i : i + batch_size]
+            batch_vectors = None
             try:
                 batch_vectors = self._embedding_provider.embed_texts(batch_slice)
             except Exception:
-                # Privacy: fail closed with generic error unchained from provider internals
-                raise RetrievalError(
-                    "Embedding provider call failed during batch processing"
-                ) from None
+                err = RetrievalError("Embedding provider call failed during batch processing")
+            if batch_vectors is None:
+                err.__cause__ = None
+                err.__context__ = None
+                raise err
 
             if not isinstance(batch_vectors, list) or len(batch_vectors) != len(batch_slice):
                 raise RetrievalContractError("Embedding provider returned mismatched vector count")
@@ -442,11 +456,19 @@ class IngestionService:
             expected_dimension=self._config.expected_dimension,
         )
 
-        # 4. Upsert into VectorIndex
-        upserted_count = self._vector_index.upsert(
-            tenant_id=valid_tenant,
-            documents=vector_docs,
-        )
+        # 4. Upsert into VectorIndex with safe exception wrapping
+        upserted_count = None
+        try:
+            upserted_count = self._vector_index.upsert(
+                tenant_id=valid_tenant,
+                documents=vector_docs,
+            )
+        except Exception:
+            err = RetrievalError("Vector index operation failed")
+        if upserted_count is None:
+            err.__cause__ = None
+            err.__context__ = None
+            raise err
 
         return IngestionResult(
             tenant_id=valid_tenant,
@@ -478,7 +500,7 @@ class IngestionService:
 
         Raises:
             RetrievalContractError: If query parameters, filters, or returned results violate contracts.
-            RetrievalError: Generic unchained error if embedding generation fails.
+            RetrievalError: Generic unchained error if embedding generation or vector index search fails.
         """
         valid_tenant = validate_tenant_scope(tenant_id)
 
@@ -507,11 +529,15 @@ class IngestionService:
             safe_filters = {}
 
         # Generate query embedding
+        vectors = None
         try:
             vectors = self._embedding_provider.embed_texts([query_text])
         except Exception:
-            # Privacy: unchain provider error to prevent secret/prompt leaks
-            raise RetrievalError("Failed to generate embedding for query") from None
+            err = RetrievalError("Failed to generate embedding for query")
+        if vectors is None:
+            err.__cause__ = None
+            err.__context__ = None
+            raise err
 
         if not isinstance(vectors, list) or len(vectors) != 1:
             raise RetrievalContractError("Embedding provider returned invalid vectors for query")
@@ -530,7 +556,15 @@ class IngestionService:
             filter_metadata=safe_filters,
         )
 
-        results = self._vector_index.search(bundle)
+        results = None
+        try:
+            results = self._vector_index.search(bundle)
+        except Exception:
+            err = RetrievalError("Vector index search operation failed")
+        if results is None:
+            err.__cause__ = None
+            err.__context__ = None
+            raise err
 
         if not isinstance(results, list):
             raise RetrievalContractError("VectorIndex search returned invalid result type")
