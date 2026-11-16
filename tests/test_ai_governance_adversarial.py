@@ -14,6 +14,7 @@ import pytest
 from flowforge.ai.governance.exceptions import (
     AIBudgetExhaustedError,
     AIDuplicateSettlementError,
+    AIGovernanceError,
     AIInvalidReservationStateError,
     AIProviderPolicyDeniedError,
     AIReservationNotFoundError,
@@ -38,19 +39,20 @@ def test_adversarial_exception_confidentiality_no_caller_secrets():
         assert sensitive_payload not in target
 
     # 2. AIDuplicateSettlementError
-    err2 = AIDuplicateSettlementError(reservation_id=sensitive_payload)
+    err2 = AIDuplicateSettlementError(reservation_id=sensitive_payload, message=sensitive_payload)
     for target in (str(err2), repr(err2), str(err2.args), str(err2.details), str(err2.__dict__)):
         assert sensitive_payload not in target
 
     # 3. AIInvalidReservationStateError
     err3 = AIInvalidReservationStateError(
         reservation_id=sensitive_payload,
-        current_status="pending",
+        current_status=sensitive_payload,
         attempted_action=sensitive_payload,
     )
     for target in (str(err3), repr(err3), str(err3.args), str(err3.details), str(err3.__dict__)):
         assert sensitive_payload not in target
     assert err3.action_code == "unknown_action"
+    assert err3.current_status == "unknown_status"
 
     # 4. AIProviderPolicyDeniedError
     err4 = AIProviderPolicyDeniedError(provider=sensitive_payload, reason=sensitive_payload)
@@ -66,8 +68,17 @@ def test_adversarial_exception_confidentiality_no_caller_secrets():
         assert sensitive_payload not in target
 
     # 6. AIBudgetExhaustedError
-    err6 = AIBudgetExhaustedError(scope_key=sensitive_payload)
+    err6 = AIBudgetExhaustedError(message=sensitive_payload, scope_key=sensitive_payload)
     for target in (str(err6), repr(err6), str(err6.args), str(err6.details), str(err6.__dict__)):
+        assert sensitive_payload not in target
+
+    # 7. AIGovernanceError with custom code/details
+    err7 = AIGovernanceError(
+        message=sensitive_payload,
+        code=sensitive_payload,
+        details={"custom_secret_key": sensitive_payload},
+    )
+    for target in (str(err7), repr(err7), str(err7.args), str(err7.details), str(err7.__dict__)):
         assert sensitive_payload not in target
 
 
