@@ -319,8 +319,8 @@ def test_query_enforces_max_top_k():
     cfg = IngestionConfig(max_top_k=5)
     svc = IngestionService(provider, index, config=cfg)
 
-    svc.query("tenant-1", "hello", top_k=50)
-    assert index.search_calls[0].top_k == 5  # Clamped to max_top_k
+    with pytest.raises(RetrievalContractError, match="top_k exceeds maximum allowed limit"):
+        svc.query("tenant-1", "hello", top_k=50)
 
 
 def test_query_foreign_tenant_result_fails_closed():
@@ -336,7 +336,9 @@ def test_query_foreign_tenant_result_fails_closed():
         content="foreign content",
     )
 
-    with pytest.raises(RetrievalContractError, match="Search result belongs to foreign tenant"):
+    with pytest.raises(
+        RetrievalContractError, match="Vector search results violated tenant safety contracts"
+    ):
         svc.query("tenant-1", "hello")
 
 

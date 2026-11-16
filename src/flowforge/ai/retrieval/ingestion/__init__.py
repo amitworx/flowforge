@@ -40,6 +40,8 @@ MAX_DOCUMENTS_PER_BATCH: int = 1_000
 MAX_CHUNKS_PER_INGEST: int = 10_000
 DEFAULT_BATCH_SIZE: int = 64
 DEFAULT_MAX_TOP_K: int = 100
+MAX_FILTER_STRING_LENGTH: int = 1_024
+MAX_SERIALIZED_FILTER_BYTES: int = 8_192
 _DOC_ID_ALLOWED_RE = re.compile(r"^[a-zA-Z0-9_\-\.:#]+$")
 _FILTER_KEY_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_\.]{0,63}$")
 _SUPPORTED_FILTER_OPERATORS = {"$eq", "$ne", "$in"}
@@ -212,36 +214,67 @@ def sanitize_and_validate_metadata(
     return json.loads(encoded)
 
 
+def _validate_filter_scalar(val: Any) -> None:
+    """Validate that val is a valid primitive scalar for metadata filtering.
+
+    Accepted types: None, bool, int, finite float, str (<= MAX_FILTER_STRING_LENGTH).
+    Rejects: dict, list, set, tuple, bytes, non-finite floats, custom objects.
+    """
+    if val is None or isinstance(val, bool):
+        return
+    if isinstance(val, int):
+        return
+    if isinstance(val, float):
+        if not math.isfinite(val):
+            raise RetrievalContractError("Filter float value must be finite")
+        return
+    if isinstance(val, str):
+        if len(val) > MAX_FILTER_STRING_LENGTH:
+            raise RetrievalContractError("Filter string value exceeds maximum length")
+        return
+    raise RetrievalContractError(f"Unsupported filter scalar value type: {type(val).__name__}")
+
+
 def validate_query_filter_bounds(filter_metadata: dict[str, Any]) -> None:
     """Validate that query filter metadata matches safe pgvector adapter semantics and bounds."""
     if not isinstance(filter_metadata, dict):
         raise RetrievalContractError("filter_metadata must be a dictionary")
     if len(filter_metadata) > 20:
         raise RetrievalContractError("filter_metadata exceeds maximum allowed filter keys")
+
     for key, val in filter_metadata.items():
         if not isinstance(key, str) or not _FILTER_KEY_PATTERN.match(key):
             raise RetrievalContractError("Invalid filter metadata key format")
         if isinstance(val, dict):
-            # Operator dict: only $eq, $ne, $in
-            for op, op_val in val.items():
-                if op not in _SUPPORTED_FILTER_OPERATORS:
-                    raise RetrievalContractError("Unsupported filter operator in metadata query")
-                if op == "$in":
-                    if not isinstance(op_val, (list, tuple, set)):
-                        raise RetrievalContractError("$in operator expects a list")
-                    if len(op_val) > MAX_FILTER_IN_ITEMS:
-                        raise RetrievalContractError("$in operator exceeds maximum allowed items")
-                    for elem in op_val:
-                        if isinstance(elem, (dict, list, set, tuple)):
-                            raise RetrievalContractError(
-                                "Elements in $in list must be scalar values"
-                            )
-                elif op in ("$eq", "$ne") and isinstance(op_val, (dict, list, set, tuple)):
-                    raise RetrievalContractError("Nested complex value not supported for operator")
-        elif isinstance(val, (dict, list, set, tuple)):
-            raise RetrievalContractError(
-                "Direct list/dict value not supported without valid operator"
-            )
+            # Operator dict: must contain exactly one supported operator
+            if len(val) != 1:
+                raise RetrievalContractError(
+                    "Filter operator dictionary must contain exactly one operator"
+                )
+            op, op_val = next(iter(val.items()))
+            if op not in _SUPPORTED_FILTER_OPERATORS:
+                raise RetrievalContractError("Unsupported filter operator in metadata query")
+
+            if op == "$in":
+                if not isinstance(op_val, (list, tuple, set)):
+                    raise RetrievalContractError("$in operator expects a list")
+                if len(op_val) > MAX_FILTER_IN_ITEMS:
+                    raise RetrievalContractError("$in operator exceeds maximum allowed items")
+                for elem in op_val:
+                    _validate_filter_scalar(elem)
+            elif op in ("$eq", "$ne"):
+                _validate_filter_scalar(op_val)
+        else:
+            # Direct scalar equality
+            _validate_filter_scalar(val)
+
+    # Validate overall serialized filter size
+    try:
+        encoded = json.dumps(filter_metadata, separators=(",", ":"), ensure_ascii=True)
+        if len(encoded.encode("utf-8")) > MAX_SERIALIZED_FILTER_BYTES:
+            raise RetrievalContractError("Serialized filter metadata exceeds maximum size")
+    except (TypeError, ValueError):
+        raise RetrievalContractError("Filter metadata is not JSON-serializable") from None
 
 
 def _is_zero_vector(vec: tuple[float, ...] | list[float]) -> bool:
@@ -450,11 +483,20 @@ class IngestionService:
                 )
             )
 
-        validate_vector_documents(
-            documents=vector_docs,
-            expected_tenant_id=valid_tenant,
-            expected_dimension=self._config.expected_dimension,
-        )
+        doc_validation_ok = False
+        try:
+            validate_vector_documents(
+                documents=vector_docs,
+                expected_tenant_id=valid_tenant,
+                expected_dimension=self._config.expected_dimension,
+            )
+            doc_validation_ok = True
+        except Exception:
+            err = RetrievalContractError("Ingestion documents violated vector or tenant invariants")
+        if not doc_validation_ok:
+            err.__cause__ = None
+            err.__context__ = None
+            raise err
 
         # 4. Upsert into VectorIndex with safe exception wrapping
         upserted_count = None
@@ -469,6 +511,15 @@ class IngestionService:
             err.__cause__ = None
             err.__context__ = None
             raise err
+
+        # Validate adapter upsert return contract
+        if (
+            isinstance(upserted_count, bool)
+            or not isinstance(upserted_count, int)
+            or upserted_count < 0
+            or upserted_count > len(vector_docs)
+        ):
+            raise RetrievalContractError("Vector index upsert returned invalid document count")
 
         return IngestionResult(
             tenant_id=valid_tenant,
@@ -491,7 +542,7 @@ class IngestionService:
         Args:
             tenant_id: Verified caller tenant identifier.
             query_text: Raw query text.
-            top_k: Number of results to retrieve (must be strict positive integer).
+            top_k: Number of results to retrieve (must be strict positive integer <= config.max_top_k).
             score_threshold: Optional similarity score threshold (must be finite float/int).
             filter_metadata: Optional key-value filter metadata matching pgvector semantics.
 
@@ -510,9 +561,12 @@ class IngestionService:
         if len(query_text) > MAX_TEXT_CONTENT_LENGTH:
             raise RetrievalContractError("query_text length exceeds maximum allowed limit")
 
-        # Validate top_k strictly
+        # Validate top_k strictly; reject exceeding config.max_top_k fail-closed
         _validate_strict_int(top_k, "top_k", min_val=1)
-        bounded_top_k = min(top_k, self._config.max_top_k)
+        if top_k > self._config.max_top_k:
+            raise RetrievalContractError(
+                f"top_k exceeds maximum allowed limit ({top_k} > {self._config.max_top_k})"
+            )
 
         # Validate score_threshold strictly before any external calls
         if score_threshold is not None:
@@ -551,7 +605,7 @@ class IngestionService:
             tenant_id=valid_tenant,
             query_text=query_text,
             query_vector=tuple(q_vec),
-            top_k=bounded_top_k,
+            top_k=top_k,
             score_threshold=score_threshold,
             filter_metadata=safe_filters,
         )
@@ -569,7 +623,17 @@ class IngestionService:
         if not isinstance(results, list):
             raise RetrievalContractError("VectorIndex search returned invalid result type")
 
-        # Validate that results strictly adhere to caller's tenant_id and invariants
-        validate_search_results(results, expected_tenant_id=valid_tenant)
+        # Validate that results strictly adhere to caller's tenant_id and invariants,
+        # translating any failure to a generic error that does NOT leak foreign IDs, tenants, or scores.
+        validation_ok = False
+        try:
+            validate_search_results(results, expected_tenant_id=valid_tenant)
+            validation_ok = True
+        except Exception:
+            err = RetrievalContractError("Vector search results violated tenant safety contracts")
+        if not validation_ok:
+            err.__cause__ = None
+            err.__context__ = None
+            raise err
 
         return results
