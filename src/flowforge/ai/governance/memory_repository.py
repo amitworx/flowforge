@@ -8,6 +8,7 @@ and idempotency checking.
 from __future__ import annotations
 
 import datetime
+import math
 import threading
 from collections.abc import Mapping
 from typing import Any
@@ -159,7 +160,6 @@ class InMemoryBudgetRepository:
             existing_id = self._reservation_idempotency.get(scoped_key)
 
             if global_res_id and not existing_id:
-                # Key was used by a different tenant or different scope!
                 raise AIDuplicateSettlementError(
                     global_res_id,
                     "Idempotency key reused across different tenant or scope",
@@ -387,7 +387,7 @@ class InMemoryBudgetRepository:
 
             if existing_s_id:
                 existing = self._settlements[existing_s_id]
-                # Strict comparison across all settlement fields
+                # Strict comparison across ALL settlement fields including duration
                 if (
                     existing.reservation_id == reservation_id
                     and existing.actual_prompt_tokens == actual_prompt_tokens
@@ -399,6 +399,7 @@ class InMemoryBudgetRepository:
                     and existing.overrun_marker == overrun_marker
                     and existing.overrun_tokens == overrun_tokens
                     and existing.overrun_cost_micros == overrun_cost_micros
+                    and math.isclose(existing.duration_seconds, duration_seconds, rel_tol=1e-5)
                 ):
                     return (existing, True)
                 raise AIDuplicateSettlementError(

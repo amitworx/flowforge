@@ -8,12 +8,18 @@ from __future__ import annotations
 
 import datetime
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
 from flowforge.ai.governance.exceptions import AIGovernanceError
+
+SAFE_IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]{1,64}$")
+UUID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 ALLOWED_AUDIT_METADATA_KEYS = frozenset(
     {
@@ -33,11 +39,24 @@ ALLOWED_AUDIT_METADATA_KEYS = frozenset(
     }
 )
 
+VALID_STATUS_STRINGS = frozenset({"pending", "settled", "released", "expired", "failed", "success"})
+
+
+def validate_identifier(val: str, field_name: str) -> None:
+    """Validates that an identifier (provider, model, idempotency key) is bounded and contains only safe characters."""
+    if not isinstance(val, str) or not val:
+        raise AIGovernanceError(f"{field_name} must be a non-empty string")
+    if len(val) > 128:
+        raise AIGovernanceError(f"{field_name} length must not exceed 128 characters")
+    # Disallow control characters, path traversal, null bytes
+    if any(c in val for c in ("\x00", "/", "\\", "\n", "\r", "\t", " ", ";")):
+        raise AIGovernanceError(f"{field_name} contains invalid characters")
+
 
 def sanitize_audit_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str]:
-    """Sanitizes audit metadata by allowlisting permitted bounded keys and casting values to strings.
+    """Sanitizes audit metadata by allowlisting permitted bounded keys and casting values to strictly typed strings.
 
-    Strips any raw prompts, authorization headers, api keys, or sensitive fields.
+    Drops arbitrary unknown strings to prevent storing unknown-format printable secrets.
     """
     if not metadata:
         return {}
@@ -45,17 +64,35 @@ def sanitize_audit_metadata(metadata: Mapping[str, Any] | None) -> dict[str, str
     for k, v in metadata.items():
         key_str = str(k).lower().strip()
         if key_str in ALLOWED_AUDIT_METADATA_KEYS and v is not None:
-            # Bound value string length to 256 chars max
-            val_str = str(v)[:256]
-            lower_val = val_str.lower()
-            if (
-                "bearer " in lower_val
-                or "sk-" in lower_val
-                or "secret" in lower_val
-                or "token" in lower_val
-            ):
-                continue
-            clean[key_str] = val_str
+            val_str = str(v).strip()
+            # Enforce strict typing / format validation per field:
+            if key_str in ("job_id", "workflow_id", "run_id", "tenant_id", "user_id"):
+                if SAFE_IDENTIFIER_PATTERN.match(val_str) or UUID_PATTERN.match(val_str):
+                    clean[key_str] = val_str[:64]
+            elif key_str == "correlation_id":
+                # Must be valid UUID or alphanumeric hex/dash identifier
+                if (
+                    UUID_PATTERN.match(val_str) or SAFE_IDENTIFIER_PATTERN.match(val_str)
+                ) and not any(val_str.startswith(p) for p in ("ghp_", "sk-", "eyJ", "gho_")):
+                    clean[key_str] = val_str[:64]
+            elif key_str in ("provider", "model", "step_name", "client_version"):
+                if SAFE_IDENTIFIER_PATTERN.match(val_str):
+                    clean[key_str] = val_str[:64]
+            elif key_str == "status":
+                if val_str.lower() in VALID_STATUS_STRINGS:
+                    clean[key_str] = val_str.lower()
+            elif key_str == "reason":
+                # Fixed reason strings only
+                if val_str in (
+                    "user_cancelled",
+                    "released_without_usage",
+                    "timeout",
+                    "policy_denied",
+                    "completed",
+                ):
+                    clean[key_str] = val_str
+            elif key_str == "attempt" and isinstance(v, (int, str)) and str(v).isdigit():
+                clean[key_str] = str(v)[:8]
     return clean
 
 
@@ -65,7 +102,7 @@ def sanitize_note(note: str) -> str:
         return ""
     # Truncate and strip sensitive prefixes/substrings
     lower_note = note.lower()
-    for sensitive_sub in ("bearer ", "sk-", "secret", "token", "password", "prompt"):
+    for sensitive_sub in ("bearer ", "sk-", "secret", "token", "password", "prompt", "ghp_"):
         if sensitive_sub in lower_note:
             return "Sanitized note (sensitive content removed)"
     return note[:256]
@@ -111,6 +148,15 @@ class BudgetScope:
             raise AIGovernanceError("tenant_id and run_id are required for RUN budget scope")
         if self.scope_type == BudgetScopeType.PROVIDER and not self.provider:
             raise AIGovernanceError("provider is required for PROVIDER budget scope")
+
+        for name, ident in [
+            ("tenant_id", self.tenant_id),
+            ("workflow_id", self.workflow_id),
+            ("run_id", self.run_id),
+            ("provider", self.provider),
+        ]:
+            if ident is not None:
+                validate_identifier(ident, name)
 
     @property
     def key(self) -> str:
@@ -191,11 +237,26 @@ class BudgetSettings:
                 "max_duration_seconds must be a non-negative finite float or None"
             )
 
-        # Normalize provider tuples
-        if not isinstance(self.allowed_providers, tuple):
-            object.__setattr__(self, "allowed_providers", tuple(self.allowed_providers))
-        if not isinstance(self.denied_providers, tuple):
-            object.__setattr__(self, "denied_providers", tuple(self.denied_providers))
+        # Validate allowed_providers & denied_providers must be tuples/lists of strings, NOT a bare string
+        if isinstance(self.allowed_providers, str):
+            raise AIGovernanceError(
+                "allowed_providers must be a tuple or list of strings, not a bare string"
+            )
+        if isinstance(self.denied_providers, str):
+            raise AIGovernanceError(
+                "denied_providers must be a tuple or list of strings, not a bare string"
+            )
+
+        allowed_tuple = tuple(self.allowed_providers)
+        denied_tuple = tuple(self.denied_providers)
+
+        for p in allowed_tuple:
+            validate_identifier(p, "allowed_provider")
+        for p in denied_tuple:
+            validate_identifier(p, "denied_provider")
+
+        object.__setattr__(self, "allowed_providers", allowed_tuple)
+        object.__setattr__(self, "denied_providers", denied_tuple)
 
 
 class ReservationStatus(StrEnum):
@@ -254,6 +315,8 @@ class ReservationRecord:
             raise AIGovernanceError("reservation_id cannot be empty")
         if not self.idempotency_key:
             raise AIGovernanceError("idempotency_key cannot be empty")
+        validate_identifier(self.provider, "provider")
+        validate_identifier(self.model, "model")
         if self.attempt_number < 1:
             raise AIGovernanceError("attempt_number must be >= 1")
         if self.created_at.tzinfo is None:
@@ -289,6 +352,8 @@ class SettlementRecord:
             raise AIGovernanceError("settlement_id cannot be empty")
         if not self.reservation_id:
             raise AIGovernanceError("reservation_id cannot be empty")
+        validate_identifier(self.provider, "provider")
+        validate_identifier(self.model, "model")
         if self.settled_at.tzinfo is None:
             raise AIGovernanceError("settled_at must be timezone-aware (UTC)")
         for name, val in [
