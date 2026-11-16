@@ -27,6 +27,7 @@ INSTALLED_APPS = [
     "flowforge.core",
     "flowforge.processing",
     "flowforge.workflows",
+    "flowforge.ai.governance.db.apps.AIGovernanceDBConfig",
 ]
 
 MIDDLEWARE = [
