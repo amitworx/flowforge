@@ -176,13 +176,16 @@ class AIBudgetPolicyService:
         duration_seconds: float = 0.0,
         idempotency_key: str | None = None,
         audit_metadata: Mapping[str, Any] | None = None,
+        internal_privileged: bool = False,
     ) -> SettlementRecord:
         """Atomically settle a completed or failed reservation."""
         if scope is not None:
             res = self._repo.get_reservation_by_id(reservation_id, scope=scope)
-        else:
-            # Internal privileged lookup to find reservation and assert its scope
+        elif internal_privileged:
+            # Trusted server-side reconciliation only
             res = self._repo.get_reservation_by_id(reservation_id, internal_privileged=True)
+        else:
+            raise AIGovernanceError("Scope is required for settlement authorization")
         if not res:
             raise AIGovernanceError("Reservation not found")
 
@@ -358,13 +361,17 @@ class AIBudgetPolicyService:
         scope: BudgetScope | None = None,
         idempotency_key: str | None = None,
         reason: str = "released_without_usage",
+        internal_privileged: bool = False,
     ) -> ReservationRecord:
         """Release reservation without incurring cost or token usage."""
         now = self._now()
         if scope is not None:
             res = self._repo.get_reservation_by_id(reservation_id, scope=scope)
-        else:
+        elif internal_privileged:
+            # Trusted server-side reconciliation only
             res = self._repo.get_reservation_by_id(reservation_id, internal_privileged=True)
+        else:
+            raise AIGovernanceError("Scope is required for release authorization")
         if not res:
             raise AIGovernanceError("Reservation not found")
 

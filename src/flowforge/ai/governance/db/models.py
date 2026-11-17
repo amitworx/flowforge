@@ -159,6 +159,7 @@ class AIReservationModel(models.Model):
         default=DispatchStatusChoice.NOT_DISPATCHED,
         db_index=True,
     )
+    release_idempotency_key = models.CharField(max_length=128, null=True, blank=True, db_index=True)
     created_at = models.DateTimeField(db_index=True)
     expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
     audit_metadata = models.JSONField(default=dict, blank=True)

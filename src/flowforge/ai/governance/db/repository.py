@@ -774,7 +774,7 @@ class PostgreSQLBudgetRepository(BudgetRepository):
         reason: str = "Released without usage",
         ledger_entry: UsageLedgerEntry | None = None,
     ) -> tuple[ReservationRecord, bool]:
-        del idempotency_key, released_at, reason
+        del released_at, reason
 
         def _txn() -> tuple[ReservationRecord, bool]:
             with transaction.atomic():
@@ -799,6 +799,13 @@ class PostgreSQLBudgetRepository(BudgetRepository):
                         raise AIReservationNotFoundError(reservation_id)
 
                 if res.status == ReservationStatus.RELEASED.value:
+                    if (
+                        res.release_idempotency_key is not None
+                        and res.release_idempotency_key != idempotency_key
+                    ):
+                        raise AIDuplicateSettlementError(
+                            reservation_id, "Conflicting release idempotency key"
+                        )
                     return (self._reservation_to_record(res), True)
 
                 if res.status != ReservationStatus.PENDING.value:
@@ -827,7 +834,8 @@ class PostgreSQLBudgetRepository(BudgetRepository):
                     )
 
                 res.status = ReservationStatus.RELEASED.value
-                res.save(update_fields=["status"])
+                res.release_idempotency_key = idempotency_key
+                res.save(update_fields=["status", "release_idempotency_key"])
 
                 if ledger_entry:
                     self._persist_ledger_entry(ledger_entry)
@@ -845,8 +853,6 @@ class PostgreSQLBudgetRepository(BudgetRepository):
         to_status: DispatchStatus,
         attempt_number: int,
     ) -> ReservationRecord:
-        del from_status
-
         def _txn() -> ReservationRecord:
             with transaction.atomic():
                 res = (
@@ -865,6 +871,10 @@ class PostgreSQLBudgetRepository(BudgetRepository):
                     if scope.run_id is not None and scope.run_id != res.run_id:
                         raise AIReservationNotFoundError(reservation_id)
 
+                # Reservation accounting state check: only PENDING reservations can transition dispatch
+                if res.status != ReservationStatus.PENDING.value:
+                    raise AIInvalidReservationStateError(reservation_id, res.status, "dispatch")
+
                 if res.attempt_number != attempt_number:
                     raise AIStaleFencedAttemptError(
                         reservation_id,
@@ -875,6 +885,16 @@ class PostgreSQLBudgetRepository(BudgetRepository):
                 current_dispatch = getattr(
                     res, "dispatch_status", DispatchStatus.NOT_DISPATCHED.value
                 )
+                from_val = (
+                    from_status.value
+                    if isinstance(from_status, DispatchStatus)
+                    else str(from_status)
+                )
+                if current_dispatch != from_val:
+                    raise AIInvalidReservationStateError(
+                        reservation_id, current_dispatch, "dispatch"
+                    )
+
                 legal_transitions = {
                     DispatchStatus.NOT_DISPATCHED.value: {DispatchStatus.DISPATCH_STARTED.value},
                     DispatchStatus.DISPATCH_STARTED.value: {

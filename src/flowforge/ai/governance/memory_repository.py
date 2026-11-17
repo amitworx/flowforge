@@ -54,6 +54,8 @@ class InMemoryBudgetRepository:
         # map (tenant_id, idempotency_key) -> settlement_id
         self._settlement_idempotency: dict[tuple[str | None, str], str] = {}
         self._global_settlement_idempotency: dict[str, str] = {}
+        # map reservation_id -> release_idempotency_key
+        self._release_idempotency_by_reservation: dict[str, str] = {}
         # ledger entries
         self._ledger: list[UsageLedgerEntry] = []
 
@@ -545,7 +547,7 @@ class InMemoryBudgetRepository:
         reason: str = "Released without usage",
         ledger_entry: UsageLedgerEntry | None = None,
     ) -> tuple[ReservationRecord, bool]:
-        del idempotency_key, released_at, reason
+        del released_at, reason
         with self._lock:
             res = self._reservations.get(reservation_id)
             if not res:
@@ -565,6 +567,11 @@ class InMemoryBudgetRepository:
                     raise AIReservationNotFoundError(reservation_id)
 
             if res.status == ReservationStatus.RELEASED:
+                recorded_key = self._release_idempotency_by_reservation.get(reservation_id)
+                if recorded_key is not None and recorded_key != idempotency_key:
+                    raise AIDuplicateSettlementError(
+                        reservation_id, "Conflicting release idempotency key"
+                    )
                 return (res, True)
 
             # Prevent release if already settled or expired
@@ -595,6 +602,7 @@ class InMemoryBudgetRepository:
                 dispatch_status=res.dispatch_status,
             )
             self._reservations[reservation_id] = updated_res
+            self._release_idempotency_by_reservation[reservation_id] = idempotency_key
             if ledger_entry:
                 self._ledger.append(ledger_entry)
             return (updated_res, False)
@@ -608,7 +616,6 @@ class InMemoryBudgetRepository:
         to_status: DispatchStatus,
         attempt_number: int,
     ) -> ReservationRecord:
-        del from_status
         with self._lock:
             res = self._reservations.get(reservation_id)
             if not res:
@@ -623,12 +630,22 @@ class InMemoryBudgetRepository:
                 if scope.run_id is not None and scope.run_id != res.scope.run_id:
                     raise AIReservationNotFoundError(reservation_id)
 
+            # Reservation accounting state check: only PENDING reservations can transition dispatch
+            if res.status != ReservationStatus.PENDING:
+                raise AIInvalidReservationStateError(reservation_id, res.status.value, "dispatch")
+
             # Fencing attempt check
             if attempt_number != res.attempt_number:
                 raise AIStaleFencedAttemptError(
                     reservation_id,
                     expected_attempt=res.attempt_number,
                     actual_attempt=attempt_number,
+                )
+
+            # CAS verification: compare-and-swap
+            if res.dispatch_status != from_status:
+                raise AIInvalidReservationStateError(
+                    reservation_id, res.dispatch_status.value, "dispatch"
                 )
 
             # Validate legal transitions

@@ -193,6 +193,7 @@ def test_strict_settlement_replay_each_parameter():
 
     base_settle = {
         "reservation_id": res.reservation_id,
+        "scope": scope,
         "actual_prompt_tokens": 80,
         "actual_completion_tokens": 40,
         "actual_cost_micros": 120,

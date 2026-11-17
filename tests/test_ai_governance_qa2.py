@@ -111,6 +111,7 @@ def test_confidentiality_no_raw_tokens_or_secrets_in_errors():
     # Releasing with secret in reason string
     service.release(
         reservation_id=res.reservation_id,
+        scope=scope,
         reason=f"Failed due to secret {secret_key}",
     )
 
