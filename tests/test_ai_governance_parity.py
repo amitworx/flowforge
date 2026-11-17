@@ -264,6 +264,7 @@ def test_release_and_state_invalidation(repo):
     released, is_replayed = repo.release_reservation(
         reservation_id="res-rel",
         idempotency_key="idemp-rel",
+        scope=scope,
         released_at=now,
     )
     assert not is_replayed
@@ -273,6 +274,7 @@ def test_release_and_state_invalidation(repo):
     released_2, is_replayed_2 = repo.release_reservation(
         reservation_id="res-rel",
         idempotency_key="idemp-rel",
+        scope=scope,
         released_at=now,
     )
     assert is_replayed_2

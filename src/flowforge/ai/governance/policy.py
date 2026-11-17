@@ -167,6 +167,7 @@ class AIBudgetPolicyService:
         self,
         *,
         reservation_id: str,
+        scope: BudgetScope | None = None,
         actual_prompt_tokens: int | None = None,
         actual_completion_tokens: int | None = None,
         actual_cost_micros: int | None = None,
@@ -177,7 +178,11 @@ class AIBudgetPolicyService:
         audit_metadata: Mapping[str, Any] | None = None,
     ) -> SettlementRecord:
         """Atomically settle a completed or failed reservation."""
-        res = self._repo.get_reservation_by_id(reservation_id)
+        if scope is not None:
+            res = self._repo.get_reservation_by_id(reservation_id, scope=scope)
+        else:
+            # Internal privileged lookup to find reservation and assert its scope
+            res = self._repo.get_reservation_by_id(reservation_id, internal_privileged=True)
         if not res:
             raise AIGovernanceError("Reservation not found")
 
@@ -350,12 +355,16 @@ class AIBudgetPolicyService:
         self,
         *,
         reservation_id: str,
+        scope: BudgetScope | None = None,
         idempotency_key: str | None = None,
         reason: str = "released_without_usage",
     ) -> ReservationRecord:
         """Release reservation without incurring cost or token usage."""
         now = self._now()
-        res = self._repo.get_reservation_by_id(reservation_id)
+        if scope is not None:
+            res = self._repo.get_reservation_by_id(reservation_id, scope=scope)
+        else:
+            res = self._repo.get_reservation_by_id(reservation_id, internal_privileged=True)
         if not res:
             raise AIGovernanceError("Reservation not found")
 
@@ -377,6 +386,7 @@ class AIBudgetPolicyService:
         record, _ = self._repo.release_reservation(
             reservation_id=reservation_id,
             idempotency_key=idem_key,
+            scope=res.scope,
             released_at=now,
             reason=reason,
             ledger_entry=ledger_entry,

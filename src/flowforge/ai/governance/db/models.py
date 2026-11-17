@@ -124,6 +124,13 @@ class AIReservationModel(models.Model):
         RELEASED = "released", "Released"
         EXPIRED = "expired", "Expired"
 
+    class DispatchStatusChoice(models.TextChoices):
+        NOT_DISPATCHED = "not_dispatched", "Not Dispatched"
+        DISPATCH_STARTED = "dispatch_started", "Dispatch Started"
+        RESPONSE_RECEIVED = "response_received", "Response Received"
+        RESPONSE_LOST = "response_lost", "Response Lost"
+        BILLING_UNCERTAIN = "billing_uncertain", "Billing Uncertain"
+
     reservation_id = models.CharField(max_length=128, primary_key=True)
     idempotency_key = models.CharField(max_length=128, db_index=True)
 
@@ -145,6 +152,12 @@ class AIReservationModel(models.Model):
 
     status = models.CharField(
         max_length=32, choices=Status.choices, default=Status.PENDING, db_index=True
+    )
+    dispatch_status = models.CharField(
+        max_length=32,
+        choices=DispatchStatusChoice.choices,
+        default=DispatchStatusChoice.NOT_DISPATCHED,
+        db_index=True,
     )
     created_at = models.DateTimeField(db_index=True)
     expires_at = models.DateTimeField(null=True, blank=True, db_index=True)

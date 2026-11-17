@@ -504,7 +504,7 @@ def test_overrun_fail_closed_when_disallowed(
     assert "budget overrun (tokens_overrun)" in str(exc_info.value)
 
     # Verify repository still recorded the settled state so exposure is NOT lost
-    saved_res = repo.get_reservation_by_id(res.reservation_id)
+    saved_res = repo.get_reservation_by_id(res.reservation_id, scope=scope)
     assert saved_res.status == ReservationStatus.SETTLED
 
 

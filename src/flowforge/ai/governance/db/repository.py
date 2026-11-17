@@ -41,6 +41,7 @@ from flowforge.ai.governance.models import (
     BudgetScope,
     BudgetScopeType,
     BudgetSettings,
+    DispatchStatus,
     OverrunMarker,
     ReservationRecord,
     ReservationStatus,
@@ -125,6 +126,9 @@ class PostgreSQLBudgetRepository(BudgetRepository):
             created_at=m.created_at,
             expires_at=m.expires_at,
             audit_metadata=m.audit_metadata,
+            dispatch_status=DispatchStatus(
+                getattr(m, "dispatch_status", DispatchStatus.NOT_DISPATCHED.value)
+            ),
         )
 
     @staticmethod
@@ -294,10 +298,27 @@ class PostgreSQLBudgetRepository(BudgetRepository):
     # Lookups & Full-Scope Tenant Authorization
     # -------------------------------------------------------------------------
 
-    def get_reservation_by_id(self, reservation_id: str) -> ReservationRecord | None:
+    def get_reservation_by_id(
+        self,
+        reservation_id: str,
+        scope: BudgetScope | None = None,
+        *,
+        internal_privileged: bool = False,
+    ) -> ReservationRecord | None:
         m = AIReservationModel.objects.filter(reservation_id=reservation_id).first()
         if not m:
             return None
+        if not internal_privileged:
+            if scope is not None:
+                if m.tenant_id != scope.tenant_id:
+                    return None
+                if scope.workflow_id is not None and m.workflow_id != scope.workflow_id:
+                    return None
+                if scope.run_id is not None and m.run_id != scope.run_id:
+                    return None
+            else:
+                if m.tenant_id is not None:
+                    return None
         return self._reservation_to_record(m)
 
     def get_reservation_by_idempotency_key(
@@ -323,10 +344,27 @@ class PostgreSQLBudgetRepository(BudgetRepository):
                 return None
         return self._reservation_to_record(m)
 
-    def get_settlement_by_id(self, settlement_id: str) -> SettlementRecord | None:
+    def get_settlement_by_id(
+        self,
+        settlement_id: str,
+        scope: BudgetScope | None = None,
+        *,
+        internal_privileged: bool = False,
+    ) -> SettlementRecord | None:
         m = AISettlementModel.objects.filter(settlement_id=settlement_id).first()
         if not m:
             return None
+        if not internal_privileged:
+            if scope is not None:
+                if m.tenant_id != scope.tenant_id:
+                    return None
+                if scope.workflow_id is not None and m.workflow_id != scope.workflow_id:
+                    return None
+                if scope.run_id is not None and m.run_id != scope.run_id:
+                    return None
+            else:
+                if m.tenant_id is not None:
+                    return None
         return self._settlement_to_record(m)
 
     def get_settlement_by_idempotency_key(
@@ -349,10 +387,27 @@ class PostgreSQLBudgetRepository(BudgetRepository):
                 return None
         return self._settlement_to_record(m)
 
-    def get_settlement_by_reservation_id(self, reservation_id: str) -> SettlementRecord | None:
+    def get_settlement_by_reservation_id(
+        self,
+        reservation_id: str,
+        scope: BudgetScope | None = None,
+        *,
+        internal_privileged: bool = False,
+    ) -> SettlementRecord | None:
         m = AISettlementModel.objects.filter(reservation_id=reservation_id).first()
         if not m:
             return None
+        if not internal_privileged:
+            if scope is not None:
+                if m.tenant_id != scope.tenant_id:
+                    return None
+                if scope.workflow_id is not None and m.workflow_id != scope.workflow_id:
+                    return None
+                if scope.run_id is not None and m.run_id != scope.run_id:
+                    return None
+            else:
+                if m.tenant_id is not None:
+                    return None
         return self._settlement_to_record(m)
 
     # -------------------------------------------------------------------------
@@ -714,6 +769,7 @@ class PostgreSQLBudgetRepository(BudgetRepository):
         *,
         reservation_id: str,
         idempotency_key: str,
+        scope: BudgetScope | None = None,
         released_at: datetime.datetime,
         reason: str = "Released without usage",
         ledger_entry: UsageLedgerEntry | None = None,
@@ -730,11 +786,32 @@ class PostgreSQLBudgetRepository(BudgetRepository):
                 if not res:
                     raise AIReservationNotFoundError(reservation_id)
 
+                # Full-scope tenant authorization
+                if res.tenant_id:
+                    if scope is None or scope.tenant_id != res.tenant_id:
+                        raise AIReservationNotFoundError(reservation_id)
+                    if scope.workflow_id is not None and scope.workflow_id != res.workflow_id:
+                        raise AIReservationNotFoundError(reservation_id)
+                    if scope.run_id is not None and scope.run_id != res.run_id:
+                        raise AIReservationNotFoundError(reservation_id)
+                else:
+                    if scope is not None and scope.tenant_id is not None:
+                        raise AIReservationNotFoundError(reservation_id)
+
                 if res.status == ReservationStatus.RELEASED.value:
                     return (self._reservation_to_record(res), True)
 
                 if res.status != ReservationStatus.PENDING.value:
                     raise AIInvalidReservationStateError(reservation_id, res.status, "release")
+
+                # Cannot release if request was already dispatched to a provider
+                current_dispatch = getattr(
+                    res, "dispatch_status", DispatchStatus.NOT_DISPATCHED.value
+                )
+                if current_dispatch != DispatchStatus.NOT_DISPATCHED.value:
+                    raise AIInvalidReservationStateError(
+                        reservation_id, current_dispatch, "release"
+                    )
 
                 # Lock scope hierarchy counters
                 res_scope = self._scope_from_model(res)
@@ -756,6 +833,71 @@ class PostgreSQLBudgetRepository(BudgetRepository):
                     self._persist_ledger_entry(ledger_entry)
 
                 return (self._reservation_to_record(res), False)
+
+        return _with_db_retry(_txn)
+
+    def transition_dispatch_status(
+        self,
+        *,
+        reservation_id: str,
+        scope: BudgetScope | None = None,
+        from_status: DispatchStatus,
+        to_status: DispatchStatus,
+        attempt_number: int,
+    ) -> ReservationRecord:
+        del from_status
+
+        def _txn() -> ReservationRecord:
+            with transaction.atomic():
+                res = (
+                    AIReservationModel.objects.select_for_update()
+                    .filter(reservation_id=reservation_id)
+                    .first()
+                )
+                if not res:
+                    raise AIReservationNotFoundError(reservation_id)
+
+                if res.tenant_id:
+                    if scope is None or scope.tenant_id != res.tenant_id:
+                        raise AIReservationNotFoundError(reservation_id)
+                    if scope.workflow_id is not None and scope.workflow_id != res.workflow_id:
+                        raise AIReservationNotFoundError(reservation_id)
+                    if scope.run_id is not None and scope.run_id != res.run_id:
+                        raise AIReservationNotFoundError(reservation_id)
+
+                if res.attempt_number != attempt_number:
+                    raise AIStaleFencedAttemptError(
+                        reservation_id,
+                        expected_attempt=res.attempt_number,
+                        actual_attempt=attempt_number,
+                    )
+
+                current_dispatch = getattr(
+                    res, "dispatch_status", DispatchStatus.NOT_DISPATCHED.value
+                )
+                legal_transitions = {
+                    DispatchStatus.NOT_DISPATCHED.value: {DispatchStatus.DISPATCH_STARTED.value},
+                    DispatchStatus.DISPATCH_STARTED.value: {
+                        DispatchStatus.RESPONSE_RECEIVED.value,
+                        DispatchStatus.RESPONSE_LOST.value,
+                        DispatchStatus.BILLING_UNCERTAIN.value,
+                    },
+                    DispatchStatus.RESPONSE_LOST.value: {DispatchStatus.BILLING_UNCERTAIN.value},
+                    DispatchStatus.BILLING_UNCERTAIN.value: set(),
+                    DispatchStatus.RESPONSE_RECEIVED.value: set(),
+                }
+                target_val = (
+                    to_status.value if isinstance(to_status, DispatchStatus) else str(to_status)
+                )
+                allowed = legal_transitions.get(current_dispatch, set())
+                if target_val not in allowed:
+                    raise AIInvalidReservationStateError(
+                        reservation_id, current_dispatch, "dispatch"
+                    )
+
+                res.dispatch_status = target_val
+                res.save(update_fields=["dispatch_status"])
+                return self._reservation_to_record(res)
 
         return _with_db_retry(_txn)
 

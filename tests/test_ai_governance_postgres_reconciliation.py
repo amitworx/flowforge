@@ -102,6 +102,7 @@ def test_pre_dispatch_cancellation_zero_cost_release():
     released, _ = repo.release_reservation(
         reservation_id="res-cancel-01",
         idempotency_key="idemp-cancel-01",
+        scope=scope,
         released_at=datetime.datetime.now(datetime.UTC),
         reason="user_cancelled",
     )
@@ -221,6 +222,7 @@ def test_counter_and_ledger_reconciliation_invariant():
     repo.release_reservation(
         reservation_id="res-rec-3",
         idempotency_key="idemp-rec-3",
+        scope=scope,
         released_at=now,
     )
 

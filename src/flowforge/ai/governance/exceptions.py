@@ -9,8 +9,23 @@ from collections.abc import Mapping
 from typing import Any
 
 # Allowlisted, fixed codes and statuses
-ALLOWED_ACTION_CODES = frozenset({"reserve", "settle", "release", "expire", "unknown_action"})
-ALLOWED_STATUS_CODES = frozenset({"pending", "settled", "released", "expired", "unknown_status"})
+ALLOWED_ACTION_CODES = frozenset(
+    {"reserve", "settle", "release", "expire", "dispatch", "unknown_action"}
+)
+ALLOWED_STATUS_CODES = frozenset(
+    {
+        "pending",
+        "settled",
+        "released",
+        "expired",
+        "not_dispatched",
+        "dispatch_started",
+        "response_received",
+        "response_lost",
+        "billing_uncertain",
+        "unknown_status",
+    }
+)
 ALLOWED_REASON_CODES = frozenset(
     {
         "provider_denied_by_default",
@@ -58,6 +73,8 @@ ALLOWED_MESSAGES = frozenset(
         "estimated_completion_tokens must be a non-negative integer",
         "estimated_cost_micros must be a non-negative integer",
         "EXACT settlement requires actual_prompt_tokens and actual_completion_tokens",
+        "Invalid dispatch status transition",
+        "Scope is required for tenant-scoped operations",
     }
 )
 
