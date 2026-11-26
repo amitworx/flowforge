@@ -39,7 +39,21 @@ ALLOWED_AUDIT_METADATA_KEYS = frozenset(
     }
 )
 
-VALID_STATUS_STRINGS = frozenset({"pending", "settled", "released", "expired", "failed", "success"})
+VALID_STATUS_STRINGS = frozenset(
+    {
+        "pending",
+        "settled",
+        "released",
+        "expired",
+        "failed",
+        "success",
+        "not_dispatched",
+        "dispatch_started",
+        "response_received",
+        "response_lost",
+        "billing_uncertain",
+    }
+)
 
 
 def validate_identifier(val: str, field_name: str) -> None:
@@ -268,6 +282,16 @@ class ReservationStatus(StrEnum):
     EXPIRED = "expired"
 
 
+class DispatchStatus(StrEnum):
+    """Network dispatch progress of an AI provider request."""
+
+    NOT_DISPATCHED = "not_dispatched"
+    DISPATCH_STARTED = "dispatch_started"
+    RESPONSE_RECEIVED = "response_received"
+    RESPONSE_LOST = "response_lost"
+    BILLING_UNCERTAIN = "billing_uncertain"
+
+
 class SettlementType(StrEnum):
     """The outcome of a completed or reconciled AI operation."""
 
@@ -309,6 +333,7 @@ class ReservationRecord:
     created_at: datetime.datetime
     expires_at: datetime.datetime | None = None
     audit_metadata: Mapping[str, str] = field(default_factory=dict)
+    dispatch_status: DispatchStatus = DispatchStatus.NOT_DISPATCHED
 
     def __post_init__(self) -> None:
         if not self.reservation_id:

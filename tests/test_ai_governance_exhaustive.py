@@ -137,10 +137,16 @@ def test_cross_tenant_isolation(service: AIBudgetPolicyService, repo: InMemoryBu
 
     # Settle Tenant A reservations
     service.settle(
-        reservation_id=res_a1.reservation_id, actual_prompt_tokens=200, actual_completion_tokens=100
+        reservation_id=res_a1.reservation_id,
+        scope=scope_a,
+        actual_prompt_tokens=200,
+        actual_completion_tokens=100,
     )
     service.settle(
-        reservation_id=res_a2.reservation_id, actual_prompt_tokens=200, actual_completion_tokens=100
+        reservation_id=res_a2.reservation_id,
+        scope=scope_a,
+        actual_prompt_tokens=200,
+        actual_completion_tokens=100,
     )
 
     # Check aggregate usages
@@ -263,6 +269,7 @@ def test_idempotent_reservation_and_settlement(service: AIBudgetPolicyService):
     # Settle once
     set1 = service.settle(
         reservation_id=res1.reservation_id,
+        scope=scope,
         actual_prompt_tokens=80,
         actual_completion_tokens=90,
         idempotency_key="settle-key-1",
@@ -272,6 +279,7 @@ def test_idempotent_reservation_and_settlement(service: AIBudgetPolicyService):
     # Redelivery of identical settlement (Celery redelivery simulation)
     set2 = service.settle(
         reservation_id=res1.reservation_id,
+        scope=scope,
         actual_prompt_tokens=80,
         actual_completion_tokens=90,
         idempotency_key="settle-key-1",
@@ -282,6 +290,7 @@ def test_idempotent_reservation_and_settlement(service: AIBudgetPolicyService):
     with pytest.raises(AIDuplicateSettlementError):
         service.settle(
             reservation_id=res1.reservation_id,
+            scope=scope,
             actual_prompt_tokens=50,
             actual_completion_tokens=50,
             idempotency_key="settle-key-CONFLICT",
@@ -310,6 +319,7 @@ def test_stale_fenced_attempt_rejection(service: AIBudgetPolicyService):
     with pytest.raises(AIStaleFencedAttemptError) as exc_info:
         service.settle(
             reservation_id=res.reservation_id,
+            scope=scope,
             actual_prompt_tokens=90,
             actual_completion_tokens=90,
             attempt_number=1,
@@ -320,6 +330,7 @@ def test_stale_fenced_attempt_rejection(service: AIBudgetPolicyService):
     # Attempt 2 or higher succeeds
     set_record = service.settle(
         reservation_id=res.reservation_id,
+        scope=scope,
         actual_prompt_tokens=90,
         actual_completion_tokens=90,
         attempt_number=2,
@@ -363,6 +374,7 @@ def test_settlement_types_accounting(
     )
     set1 = service.settle(
         reservation_id=res1.reservation_id,
+        scope=scope,
         settlement_type=SettlementType.ZERO_COST_REJECTED,
     )
     assert set1.actual_total_tokens == 0
@@ -385,6 +397,7 @@ def test_settlement_types_accounting(
     )
     set2 = service.settle(
         reservation_id=res2.reservation_id,
+        scope=scope,
         settlement_type=SettlementType.ESTIMATED_EXPOSURE,
     )
     # Retains conservative estimated exposure because tokens may have been consumed upstream
@@ -407,6 +420,7 @@ def test_settlement_types_accounting(
     )
     set3 = service.settle(
         reservation_id=res3.reservation_id,
+        scope=scope,
         actual_prompt_tokens=350,
         actual_completion_tokens=250,
         actual_cost_micros=3000,
@@ -452,6 +466,7 @@ def test_truthful_overrun_recording(service: AIBudgetPolicyService, repo: InMemo
     # Actual generation generated 1200 tokens (exceeding max_total_tokens of 1000)
     set_record = service.settle(
         reservation_id=res.reservation_id,
+        scope=scope,
         actual_prompt_tokens=400,
         actual_completion_tokens=800,  # 1200 total
         settlement_type=SettlementType.EXACT,
@@ -498,13 +513,14 @@ def test_overrun_fail_closed_when_disallowed(
     with pytest.raises(AIBudgetExhaustedError) as exc_info:
         service.settle(
             reservation_id=res.reservation_id,
+            scope=scope,
             actual_prompt_tokens=300,
             actual_completion_tokens=300,  # 600 > 500
         )
     assert "budget overrun (tokens_overrun)" in str(exc_info.value)
 
     # Verify repository still recorded the settled state so exposure is NOT lost
-    saved_res = repo.get_reservation_by_id(res.reservation_id)
+    saved_res = repo.get_reservation_by_id(res.reservation_id, scope=scope)
     assert saved_res.status == ReservationStatus.SETTLED
 
 
@@ -541,6 +557,7 @@ def test_time_budget_with_injectable_clock(
 
     set_record = service.settle(
         reservation_id=res.reservation_id,
+        scope=scope,
         actual_prompt_tokens=100,
         actual_completion_tokens=100,
         duration_seconds=15.0,
@@ -569,6 +586,7 @@ def test_privacy_guarantees(service: AIBudgetPolicyService, repo: InMemoryBudget
     )
     service.settle(
         reservation_id=res.reservation_id,
+        scope=scope,
         actual_prompt_tokens=90,
         actual_completion_tokens=90,
         audit_metadata=metadata,

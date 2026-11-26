@@ -180,6 +180,7 @@ def test_fencing_attempt_validation():
     with pytest.raises(AIStaleFencedAttemptError):
         service.settle(
             reservation_id=res.reservation_id,
+            scope=scope,
             actual_prompt_tokens=50,
             actual_completion_tokens=50,
             attempt_number=1,
@@ -189,6 +190,7 @@ def test_fencing_attempt_validation():
     with pytest.raises(AIStaleFencedAttemptError):
         service.settle(
             reservation_id=res.reservation_id,
+            scope=scope,
             actual_prompt_tokens=50,
             actual_completion_tokens=50,
             attempt_number=5,
@@ -244,6 +246,7 @@ def test_idempotent_settlement_does_not_duplicate_ledger():
 
     s1 = service.settle(
         reservation_id=res.reservation_id,
+        scope=scope,
         actual_prompt_tokens=40,
         actual_completion_tokens=40,
         idempotency_key="settle-idem-1",
@@ -254,6 +257,7 @@ def test_idempotent_settlement_does_not_duplicate_ledger():
     # Replay identical settlement
     s2 = service.settle(
         reservation_id=res.reservation_id,
+        scope=scope,
         actual_prompt_tokens=40,
         actual_completion_tokens=40,
         idempotency_key="settle-idem-1",

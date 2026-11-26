@@ -45,8 +45,18 @@ class BudgetRepository(Protocol):
         """Return currently active reserved exposure (pending reservations) for the given scope."""
         ...
 
-    def get_reservation_by_id(self, reservation_id: str) -> ReservationRecord | None:
-        """Retrieve reservation record by its unique reservation_id."""
+    def get_reservation_by_id(
+        self,
+        reservation_id: str,
+        scope: BudgetScope | None = None,
+        *,
+        internal_privileged: bool = False,
+    ) -> ReservationRecord | None:
+        """Retrieve reservation record by its unique reservation_id.
+
+        If internal_privileged is True, returns record across any tenant boundary for trusted reconciliation.
+        Otherwise, scope is enforced.
+        """
         ...
 
     def get_reservation_by_idempotency_key(
@@ -104,8 +114,14 @@ class BudgetRepository(Protocol):
         """Create a reservation record directly."""
         ...
 
-    def get_settlement_by_id(self, settlement_id: str) -> SettlementRecord | None:
-        """Retrieve settlement record by settlement_id."""
+    def get_settlement_by_id(
+        self,
+        settlement_id: str,
+        scope: BudgetScope | None = None,
+        *,
+        internal_privileged: bool = False,
+    ) -> SettlementRecord | None:
+        """Retrieve settlement record by settlement_id, optionally scoped."""
         ...
 
     def get_settlement_by_idempotency_key(
@@ -114,8 +130,14 @@ class BudgetRepository(Protocol):
         """Retrieve settlement record by idempotency_key."""
         ...
 
-    def get_settlement_by_reservation_id(self, reservation_id: str) -> SettlementRecord | None:
-        """Retrieve settlement record for a reservation."""
+    def get_settlement_by_reservation_id(
+        self,
+        reservation_id: str,
+        scope: BudgetScope | None = None,
+        *,
+        internal_privileged: bool = False,
+    ) -> SettlementRecord | None:
+        """Retrieve settlement record for a reservation, optionally scoped."""
         ...
 
     def settle_reservation(
@@ -154,6 +176,7 @@ class BudgetRepository(Protocol):
         *,
         reservation_id: str,
         idempotency_key: str,
+        scope: BudgetScope | None = None,
         released_at: datetime.datetime,
         reason: str = "Released without usage",
         ledger_entry: UsageLedgerEntry | None = None,
@@ -162,7 +185,20 @@ class BudgetRepository(Protocol):
 
         Transitions reservation PENDING -> RELEASED.
         Returns reserved allowance to the budget.
+        Requires explicit matching scope for tenant-scoped reservations.
         """
+        ...
+
+    def transition_dispatch_status(
+        self,
+        *,
+        reservation_id: str,
+        scope: BudgetScope | None = None,
+        from_status: Any,
+        to_status: Any,
+        attempt_number: int,
+    ) -> ReservationRecord:
+        """Atomically transition a reservation's network dispatch lifecycle state."""
         ...
 
     def append_ledger_entry(self, entry: UsageLedgerEntry) -> None:

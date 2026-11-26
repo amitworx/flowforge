@@ -23,7 +23,9 @@ from flowforge.ai.governance.exceptions import (
 )
 from flowforge.ai.governance.models import (
     BudgetScope,
+    BudgetScopeType,
     BudgetSettings,
+    DispatchStatus,
     OverrunMarker,
     ReservationRecord,
     ReservationStatus,
@@ -52,6 +54,8 @@ class InMemoryBudgetRepository:
         # map (tenant_id, idempotency_key) -> settlement_id
         self._settlement_idempotency: dict[tuple[str | None, str], str] = {}
         self._global_settlement_idempotency: dict[str, str] = {}
+        # map reservation_id -> release_idempotency_key
+        self._release_idempotency_by_reservation: dict[str, str] = {}
         # ledger entries
         self._ledger: list[UsageLedgerEntry] = []
 
@@ -96,7 +100,7 @@ class InMemoryBudgetRepository:
         """Scope matching: target_scope matches item_scope if all target_scope specified fields match."""
         if target_scope.scope_type != item_scope.scope_type:
             # Check hierarchical inheritance: GLOBAL covers everything; TENANT covers WORKFLOW, RUN under the same tenant
-            if target_scope.scope_type == BudgetScope.scope_type.GLOBAL:
+            if target_scope.scope_type == BudgetScopeType.GLOBAL:
                 return True
             if target_scope.tenant_id and item_scope.tenant_id != target_scope.tenant_id:
                 return False
@@ -114,9 +118,34 @@ class InMemoryBudgetRepository:
             return False
         return target_scope.provider == item_scope.provider
 
-    def get_reservation_by_id(self, reservation_id: str) -> ReservationRecord | None:
+    def _check_scope_match(self, item_scope: BudgetScope, scope: BudgetScope | None) -> bool:
+        """Enforces full-scope isolation for lookups:
+
+        - If scope is provided: must match tenant_id, workflow_id (if present in scope), and run_id (if present in scope).
+        - If scope is None: only global/unscoped items are returned.
+        """
+        if scope is not None:
+            if item_scope.tenant_id != scope.tenant_id:
+                return False
+            if scope.workflow_id is not None and item_scope.workflow_id != scope.workflow_id:
+                return False
+            return not (scope.run_id is not None and item_scope.run_id != scope.run_id)
+        return item_scope.tenant_id is None
+
+    def get_reservation_by_id(
+        self,
+        reservation_id: str,
+        scope: BudgetScope | None = None,
+        *,
+        internal_privileged: bool = False,
+    ) -> ReservationRecord | None:
         with self._lock:
-            return self._reservations.get(reservation_id)
+            res = self._reservations.get(reservation_id)
+            if not res:
+                return None
+            if not internal_privileged and not self._check_scope_match(res.scope, scope):
+                return None
+            return res
 
     def get_reservation_by_idempotency_key(
         self, idempotency_key: str, scope: BudgetScope | None = None
@@ -324,9 +353,20 @@ class InMemoryBudgetRepository:
         )
         return record
 
-    def get_settlement_by_id(self, settlement_id: str) -> SettlementRecord | None:
+    def get_settlement_by_id(
+        self,
+        settlement_id: str,
+        scope: BudgetScope | None = None,
+        *,
+        internal_privileged: bool = False,
+    ) -> SettlementRecord | None:
         with self._lock:
-            return self._settlements.get(settlement_id)
+            stl = self._settlements.get(settlement_id)
+            if not stl:
+                return None
+            if not internal_privileged and not self._check_scope_match(stl.scope, scope):
+                return None
+            return stl
 
     def get_settlement_by_idempotency_key(
         self, idempotency_key: str, scope: BudgetScope | None = None
@@ -337,14 +377,30 @@ class InMemoryBudgetRepository:
             if not s_id and not scope:
                 s_id = self._global_settlement_idempotency.get(idempotency_key)
             if s_id:
-                return self._settlements.get(s_id)
+                stl = self._settlements.get(s_id)
+                if stl and not self._check_scope_match(stl.scope, scope):
+                    return None
+                return stl
             return None
 
-    def get_settlement_by_reservation_id(self, reservation_id: str) -> SettlementRecord | None:
+    def get_settlement_by_reservation_id(
+        self,
+        reservation_id: str,
+        scope: BudgetScope | None = None,
+        *,
+        internal_privileged: bool = False,
+    ) -> SettlementRecord | None:
         with self._lock:
             s_id = self._settlement_by_reservation.get(reservation_id)
             if s_id:
-                return self._settlements.get(s_id)
+                stl = self._settlements.get(s_id)
+                if (
+                    stl
+                    and not internal_privileged
+                    and not self._check_scope_match(stl.scope, scope)
+                ):
+                    return None
+                return stl
             return None
 
     def settle_reservation(
@@ -468,6 +524,7 @@ class InMemoryBudgetRepository:
                 created_at=res.created_at,
                 expires_at=res.expires_at,
                 audit_metadata=res.audit_metadata,
+                dispatch_status=res.dispatch_status,
             )
             self._reservations[reservation_id] = updated_res
             self._settlements[settlement_id] = record
@@ -485,21 +542,47 @@ class InMemoryBudgetRepository:
         *,
         reservation_id: str,
         idempotency_key: str,
+        scope: BudgetScope | None = None,
         released_at: datetime.datetime,
         reason: str = "Released without usage",
         ledger_entry: UsageLedgerEntry | None = None,
     ) -> tuple[ReservationRecord, bool]:
-        del idempotency_key, released_at, reason
+        del released_at, reason
         with self._lock:
             res = self._reservations.get(reservation_id)
             if not res:
                 raise AIReservationNotFoundError(reservation_id)
 
+            # Tenant authorization check:
+            # If reservation has tenant_id, caller must supply matching scope
+            if res.scope.tenant_id:
+                if scope is None or scope.tenant_id != res.scope.tenant_id:
+                    raise AIReservationNotFoundError(reservation_id)
+                if scope.workflow_id is not None and scope.workflow_id != res.scope.workflow_id:
+                    raise AIReservationNotFoundError(reservation_id)
+                if scope.run_id is not None and scope.run_id != res.scope.run_id:
+                    raise AIReservationNotFoundError(reservation_id)
+            else:
+                if scope is not None and scope.tenant_id is not None:
+                    raise AIReservationNotFoundError(reservation_id)
+
             if res.status == ReservationStatus.RELEASED:
+                recorded_key = self._release_idempotency_by_reservation.get(reservation_id)
+                if recorded_key is not None and recorded_key != idempotency_key:
+                    raise AIDuplicateSettlementError(
+                        reservation_id, "Conflicting release idempotency key"
+                    )
                 return (res, True)
 
+            # Prevent release if already settled or expired
             if res.status != ReservationStatus.PENDING:
                 raise AIInvalidReservationStateError(reservation_id, res.status.value, "release")
+
+            # Prevent release if request was already dispatched to a provider!
+            if res.dispatch_status != DispatchStatus.NOT_DISPATCHED:
+                raise AIInvalidReservationStateError(
+                    reservation_id, res.dispatch_status.value, "release"
+                )
 
             updated_res = ReservationRecord(
                 reservation_id=res.reservation_id,
@@ -516,11 +599,91 @@ class InMemoryBudgetRepository:
                 created_at=res.created_at,
                 expires_at=res.expires_at,
                 audit_metadata=res.audit_metadata,
+                dispatch_status=res.dispatch_status,
             )
             self._reservations[reservation_id] = updated_res
+            self._release_idempotency_by_reservation[reservation_id] = idempotency_key
             if ledger_entry:
                 self._ledger.append(ledger_entry)
             return (updated_res, False)
+
+    def transition_dispatch_status(
+        self,
+        *,
+        reservation_id: str,
+        scope: BudgetScope | None = None,
+        from_status: DispatchStatus,
+        to_status: DispatchStatus,
+        attempt_number: int,
+    ) -> ReservationRecord:
+        with self._lock:
+            res = self._reservations.get(reservation_id)
+            if not res:
+                raise AIReservationNotFoundError(reservation_id)
+
+            # Scope validation
+            if res.scope.tenant_id:
+                if scope is None or scope.tenant_id != res.scope.tenant_id:
+                    raise AIReservationNotFoundError(reservation_id)
+                if scope.workflow_id is not None and scope.workflow_id != res.scope.workflow_id:
+                    raise AIReservationNotFoundError(reservation_id)
+                if scope.run_id is not None and scope.run_id != res.scope.run_id:
+                    raise AIReservationNotFoundError(reservation_id)
+
+            # Reservation accounting state check: only PENDING reservations can transition dispatch
+            if res.status != ReservationStatus.PENDING:
+                raise AIInvalidReservationStateError(reservation_id, res.status.value, "dispatch")
+
+            # Fencing attempt check
+            if attempt_number != res.attempt_number:
+                raise AIStaleFencedAttemptError(
+                    reservation_id,
+                    expected_attempt=res.attempt_number,
+                    actual_attempt=attempt_number,
+                )
+
+            # CAS verification: compare-and-swap
+            if res.dispatch_status != from_status:
+                raise AIInvalidReservationStateError(
+                    reservation_id, res.dispatch_status.value, "dispatch"
+                )
+
+            # Validate legal transitions
+            legal_transitions = {
+                DispatchStatus.NOT_DISPATCHED: {DispatchStatus.DISPATCH_STARTED},
+                DispatchStatus.DISPATCH_STARTED: {
+                    DispatchStatus.RESPONSE_RECEIVED,
+                    DispatchStatus.RESPONSE_LOST,
+                    DispatchStatus.BILLING_UNCERTAIN,
+                },
+                DispatchStatus.RESPONSE_LOST: {DispatchStatus.BILLING_UNCERTAIN},
+                DispatchStatus.BILLING_UNCERTAIN: set(),
+                DispatchStatus.RESPONSE_RECEIVED: set(),
+            }
+            if to_status not in legal_transitions.get(res.dispatch_status, set()):
+                raise AIInvalidReservationStateError(
+                    reservation_id, res.dispatch_status.value, "dispatch"
+                )
+
+            updated = ReservationRecord(
+                reservation_id=res.reservation_id,
+                idempotency_key=res.idempotency_key,
+                scope=res.scope,
+                provider=res.provider,
+                model=res.model,
+                estimated_prompt_tokens=res.estimated_prompt_tokens,
+                estimated_completion_tokens=res.estimated_completion_tokens,
+                estimated_total_tokens=res.estimated_total_tokens,
+                estimated_cost_micros=res.estimated_cost_micros,
+                attempt_number=res.attempt_number,
+                status=res.status,
+                created_at=res.created_at,
+                expires_at=res.expires_at,
+                audit_metadata=res.audit_metadata,
+                dispatch_status=to_status,
+            )
+            self._reservations[reservation_id] = updated
+            return updated
 
     def append_ledger_entry(self, entry: UsageLedgerEntry) -> None:
         with self._lock:
